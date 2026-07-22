@@ -8,9 +8,12 @@ import httpx
 import pandas as pd
 import numpy as np
 import streamlit as st
+import logging
+import urllib.parse
 
 from config import API_BASE_URL, API_USERNAME, API_PASSWORD, TARGET_SENSORS
 
+logger = logging.getLogger(__name__)
 
 class FortMonitorClient:
     def __init__(self, base_url: str, username: str, password: str,
@@ -48,15 +51,31 @@ class FortMonitorClient:
             self._last_auth_time = dt.datetime.now()
 
     def find_object(self, object_name: str) -> Optional[str]:
+        """Ищет ID объекта по имени. Возвращает ID или None."""
         self.ensure_session()
         url = f"{self.base_url}{self.api_version}object/find"
+        
+        #  Явно кодируем имя объекта для URL
+        encoded_name = urllib.parse.quote(object_name, safe='')
+        
+        # 🔧 Логирование для отладки
+        logger.info(f"🔍 Поиск объекта: '{object_name}' (encoded: '{encoded_name}')")
+        
         response = self._client.post(
-            url, headers=self._get_headers(),
+            url, 
+            headers=self._get_headers(),
             params={"paramName": "name", "paramValue": object_name},
         )
+        
+        logger.info(f"📡 Ответ API: status={response.status_code}")
+        
         data = response.json()
         if data.get("objects"):
-            return str(data["objects"][0]["id"])
+            object_id = str(data["objects"][0]["id"])
+            logger.info(f"✅ Объект найден: ID={object_id}")
+            return object_id
+        
+        logger.warning(f"❌ Объект '{object_name}' не найден в FortMonitor")
         return None
 
     def get_sensor_params(self, object_id: str, target_sensors: List[str]) -> Optional[str]:

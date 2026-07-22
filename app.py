@@ -17,6 +17,10 @@ from core.telemetry import parse_drain_report
 from core.model_router import get_model_router
 from core.heuristics import make_verdict
 from core.feedback import save_feedback
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 st.set_page_config(page_title="Детектор сливов топлива", layout="wide")
@@ -197,6 +201,7 @@ st.caption(f"Найдено событий в отчёте: **{len(df_drains)}**
 
 # 2. Тянем телеметрию (с кэшем)
 try:
+    logger.info(f"🔍 Запрашиваем телеметрию для объекта: '{object_name}'")
     df_telemetry = fetch_telemetry_for_object(
         object_name,
         df_drains["Время"].min().isoformat(),
@@ -206,6 +211,7 @@ try:
         min_time = df_drains["Время"].min() - pd.Timedelta(hours=6)
         max_time = df_drains["Время"].max() + pd.Timedelta(hours=6)
         
+        logger.info(f"🔍 Запрашиваем телеметрию для объекта: '{object_name}'")
         df_telemetry = fetch_telemetry_for_object(
             object_name,
             min_time.isoformat(),
