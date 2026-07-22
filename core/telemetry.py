@@ -2,23 +2,37 @@
 from __future__ import annotations
 
 import io
+import re
 from typing import Tuple, Union
 
 import pandas as pd
 
 
+def _normalize_object_name(name: str) -> str:
+    """
+    Нормализует имя объекта: убирает невидимые символы, 
+    неразрывные пробелы, приводит к нижнему регистру.
+    """
+    # Заменяем неразрывные пробелы (\xa0) и другие невидимые символы на обычные пробелы
+    name = re.sub(r'[\xa0\u2000-\u200f\u2028-\u202f\u205f-\u206f\ufeff]', ' ', name)
+    # Убираем множественные пробелы
+    name = re.sub(r'\s+', ' ', name).strip()
+    # Приводим к нижнему регистру
+    return name.lower()
+
+
 def parse_drain_report(file_input: Union[str, bytes]) -> Tuple[str, pd.DataFrame]:
     """
     Извлекает и нормализует данные о сливах из Excel-отчёта.
-    Принимает путь (str) или содержимое файла (bytes) — для совместимости
-    с st.file_uploader.
     """
     if isinstance(file_input, (bytes, bytearray)):
         df = pd.read_excel(io.BytesIO(file_input))
     else:
         df = pd.read_excel(file_input)
 
-    object_name = str(df["Отчет по топливу"].values[1]).lower()
+    # 🔧 НОРМАЛИЗАЦИЯ ИМЕНИ ОБЪЕКТА
+    raw_name = str(df["Отчет по топливу"].values[1])
+    object_name = _normalize_object_name(raw_name)
 
     drop_to = max(df.index[df["Отчет по топливу"] == "Время"])
     drop_after = max(df.index[df["Отчет по топливу"] == "Итого"])
@@ -51,4 +65,3 @@ def parse_drain_report(file_input: Union[str, bytes]) -> Tuple[str, pd.DataFrame
     df["Слив"] = df["Слив"].fillna(1000)
 
     return object_name, df
-
