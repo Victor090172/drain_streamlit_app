@@ -15,8 +15,13 @@ FEEDBACK_PATH = BASE_DIR / "feedback.csv"
 # API FortMonitor
 # ============================================================
 API_BASE_URL = "https://glonassagro.com/"
-API_USERNAME = st.secrets.get("API_USERNAME", os.getenv("API_USERNAME", "rvl_testapi"))
-API_PASSWORD = st.secrets.get("API_PASSWORD", os.getenv("API_PASSWORD", "rvltestapi2024"))
+API_USERNAME = st.secrets.get("API_USERNAME") or os.getenv("API_USERNAME")
+API_PASSWORD = st.secrets.get("API_PASSWORD") or os.getenv("API_PASSWORD")
+
+# Проверка на случай, если секреты не настроены
+if not API_USERNAME or not API_PASSWORD:
+    st.error(" API credentials not configured! Please set secrets.")
+    st.stop()
 
 TARGET_SENSORS = [
     "Внешнее питание", "Внутреннее питание", "Высота над уровнем моря",
