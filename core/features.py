@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import logging
 
+logger = logging.getLogger(__name__)
 
 def create_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
+    
     rename_map = {
         "Время": "datetime",
         "Внешнее питание (В)": "power_out",
@@ -19,10 +21,28 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
         "Уровень сигнала GSM (%)": "gsm_lvl",
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+    
+    # 2. ПОСЛЕ переименования добавляем缺失ющие (отсутствующие) колонки с дефолтами
+    defaults = {
+        "fuel_lvl": np.nan,       # критичный
+        "speed": 0.0,             # если нет — считаем что стоит
+        "gps_sensor": 10,         # если нет GPS — считаем что всё ок
+        "gsm_lvl": 100.0,         # если нет GSM — считаем что сигнал отличный
+        "alt": 0.0,
+        "power_out": 0.0,
+        "power_in": 0.0,
+    }
+    
+    for col, default_val in defaults.items():
+        if col not in df.columns:
+            df[col] = default_val
+            logger.warning(f"⚠️ Колонка '{col}' отсутствует в данных API, заполнена дефолтом {default_val}")
+
+    # Преобразуем datetime и сортируем
     df["datetime"] = pd.to_datetime(df["datetime"])
     df = df.sort_values(["object_id", "datetime"]).reset_index(drop=True)
-
-    # 1. Базовые дельты
+    
+     # 1. Базовые дельты
     df["time_diff_min"] = df.groupby("object_id")["datetime"].diff().dt.total_seconds() / 60.0
     df["time_diff_min"] = df["time_diff_min"].fillna(0).clip(lower=0.01)
     df["fuel_diff"] = df.groupby("object_id")["fuel_lvl"].diff()
@@ -75,6 +95,7 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
     df["is_gsm_weak"] = (df["gsm_lvl"] < 20).astype(int)
     df["is_connection_lost"] = (df["time_diff_min"] > 10).astype(int)
 
+    # Флаг двигателя
     if "ignition" in df.columns:
         df["is_engine_on"] = (df["ignition"] == 1).astype(int)
     else:

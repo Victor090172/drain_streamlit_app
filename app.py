@@ -10,7 +10,7 @@ import streamlit as st
 from config import (
     WINDOW_BEFORE_MIN, WINDOW_AFTER_MIN,
     MIN_POINTS_IN_TIME_WINDOW, ROW_WINDOW_SIZE,
-    EXTENDED_WINDOW_ROWS, FEEDBACK_PATH,
+    EXTENDED_WINDOW_ROWS, FEEDBACK_PATH, SENSOR_MAPPING,
 )
 from core.api import fetch_telemetry_for_object
 from core.telemetry import parse_drain_report
@@ -224,6 +224,16 @@ except Exception as e:
 if df_telemetry.empty:
     st.error("Телеметрия пуста. Проверьте имя объекта и даты.")
     st.stop()
+    
+# Показываем, какие датчики были найдены
+available_cols = [c for c in df_telemetry.columns if c in SENSOR_MAPPING.keys()]
+missing_cols = [c for c in SENSOR_MAPPING.keys() if c not in df_telemetry.columns]
+
+if missing_cols:
+    st.warning(f"⚠️ У объекта отсутствуют датчики: {', '.join(missing_cols)}. "
+              f"Для них будут использованы дефолтные значения.")
+else:
+    st.success(f"✅ Все датчики найдены: {', '.join(available_cols)}")
 
 # 3. Считаем признаки + предсказания
 router = get_model_router()
