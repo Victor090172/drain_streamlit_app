@@ -299,90 +299,100 @@ sel = st.selectbox("Выберите событие", range(len(options)), forma
 v = verdicts[sel]
 
 # ============================================================
-# ОБЪЯСНЕНИЕ РЕШЕНИЯ МОДЕЛИ (XAI)
+# ОБЪЯСНЕНИЕ РЕШЕНИЯ МОДЕЛИ (XAI) - АНАЛИЗ ВСЕГО ОКНА
 # ============================================================
 st.markdown("---")
-st.markdown("### 🧠 Почему модель приняла такое решение?")
-st.caption("Анализ ключевых признаков телеметрии в момент события")
+st.markdown("### 🧠 Почему система приняла такое решение?")
+st.caption("Анализ агрегированных признаков телеметрии во всем окне анализа (не только в момент события)")
 
-# Берем значения признаков именно для строки события
-event_features = df_feat.loc[v["event_idx"]]
+# Берем ВСЁ окно анализа, а не одну строку
+window = main_window 
 
-# Создаем 4 колонки для компактного отображения метрик
+# Рассчитываем агрегированные метрики по всему окну
+max_drop_10min = float(window['total_drop_10min'].max()) if 'total_drop_10min' in window.columns else 0.0
+max_drop_rate = float(window['fuel_drop_rate'].max()) if 'fuel_drop_rate' in window.columns else 0.0
+max_consecutive = int(window['consecutive_drops'].max()) if 'consecutive_drops' in window.columns else 0
+was_stationary = (window['speed'] == 0).mean() > 0.8  # Если >80% времени техника стояла
+gnss_anomalies_count = int(window['is_gnss_anomaly'].sum())
+conn_lost_count = int(window['is_connection_lost'].sum())
+
+# Считаем общую просадку топлива в окне (только отрицательные значения)
+total_fuel_loss = float(window[window['fuel_diff'] < 0]['fuel_diff'].sum()) if len(window[window['fuel_diff'] < 0]) > 0 else 0.0
+
+# Создаем 4 колонки для компактного отображения метрик окна
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     st.metric(
-        "Скорость падения", 
-        f"{event_features['fuel_drop_rate']:.2f} л/мин",
-        delta="Высокая ⚠️" if event_features['fuel_drop_rate'] > 1.0 else "Норма",
-        delta_color="inverse" if event_features['fuel_drop_rate'] > 1.0 else "off"
+        "Макс. просадка за 10 мин", 
+        f"{max_drop_10min:.1f} л",
+        delta="Подозрительно ⚠️" if max_drop_10min > 3.0 else "Норма",
+        delta_color="inverse" if max_drop_10min > 3.0 else "off"
     )
     st.metric(
-        "Падение за 10 мин", 
-        f"{event_features['total_drop_10min']:.1f} л",
-        delta="Подозрительно ⚠️" if event_features['total_drop_10min'] > 3.0 else "Норма",
-        delta_color="inverse" if event_features['total_drop_10min'] > 3.0 else "off"
+        "Макс. скорость падения", 
+        f"{max_drop_rate:.2f} л/мин",
+        delta="Высокая ⚠️" if max_drop_rate > 1.0 else "Норма",
+        delta_color="inverse" if max_drop_rate > 1.0 else "off"
     )
 
 with col2:
     st.metric(
-        "Монолитность падения", 
-        f"{int(event_features['consecutive_drops'])} точек",
+        "Макс. монолитность падения", 
+        f"{max_consecutive} точек",
         help="Сколько точек подряд показывают строгое снижение уровня топлива"
     )
     st.metric(
-        "Глубина просадки (15 мин)", 
-        f"{event_features['drawdown_15min']:.1f} л"
+        "Общая просадка в окне", 
+        f"{abs(total_fuel_loss):.1f} л"
     )
 
 with col3:
     st.metric(
-        "Скорость техники", 
-        f"{event_features['speed']:.1f} км/ч",
-        delta="Стоит ✅" if event_features['speed'] == 0 else "Движется",
-        delta_color="normal" if event_features['speed'] == 0 else "inverse"
+        "Режим техники", 
+        "Стоянка ✅" if was_stationary else "В движении",
+        delta_color="normal" if was_stationary else "inverse"
     )
     st.metric(
         "Двигатель", 
-        "ВКЛ" if event_features['is_engine_on'] == 1 else "ВЫКЛ"
+        "ВКЛ" if window['is_engine_on'].max() == 1 else "ВЫКЛ"
     )
 
 with col4:
     st.metric(
-        "Аномалия GPS (РЭБ)", 
-        "⚠️ Обнаружена" if event_features['is_gnss_anomaly'] == 1 else "✅ Нет",
-        delta_color="inverse" if event_features['is_gnss_anomaly'] == 1 else "off"
+        "Аномалии GPS (РЭБ)", 
+        f"⚠️ {gnss_anomalies_count} раз" if gnss_anomalies_count > 0 else "✅ Нет",
+        delta_color="inverse" if gnss_anomalies_count > 0 else "off"
     )
     st.metric(
-        "Разрыв связи", 
-        "⚠️ Был" if event_features['is_connection_lost'] == 1 else "✅ Нет",
-        delta_color="inverse" if event_features['is_connection_lost'] == 1 else "off"
+        "Разрывы связи", 
+        f"⚠️ {conn_lost_count} раз" if conn_lost_count > 0 else "✅ Нет",
+        delta_color="inverse" if conn_lost_count > 0 else "off"
     )
 
-# Генерация текстовой расшифровки на основе признаков
+# Генерация текстовой расшифровки на основе агрегированных признаков окна
 st.markdown("#### 📝 Расшифровка решения:")
 explanation = []
 
-# 1. Проверка на классический слив при стоянке
-if event_features['speed'] == 0 and event_features['total_drop_10min'] > 3.0:
-    explanation.append(f"🔴 **Техника стояла**, но зафиксирована просадка топлива **{event_features['total_drop_10min']:.1f} л** за 10 минут. Это основной триггер для подозрения на слив.")
+# 1. Проверка на классический слив при стоянке (по максимуму в окне)
+if was_stationary and max_drop_10min > 3.0:
+    explanation.append(f"🔴 **Техника преимущественно стояла**, но в окне анализа зафиксирована просадка топлива **{max_drop_10min:.1f} л** за 10 минут. Это основной триггер для подозрения на слив.")
 
 # 2. Проверка на монотонность (ключевой признак реального слива, а не шума)
-if event_features['consecutive_drops'] >= 3:
-    explanation.append(f"🔴 Зафиксировано монотонное (непрерывное) падение уровня в течение **{int(event_features['consecutive_drops'])} точек** подряд, что характерно для реального слива, а не для шума датчика.")
+if max_consecutive >= 3:
+    explanation.append(f"🔴 Зафиксировано монотонное (непрерывное) падение уровня в течение **{max_consecutive} точек** подряд, что характерно для реального слива, а не для шума датчика.")
 
 # 3. Проверка на РЭБ / помехи
-if event_features['is_gnss_anomaly'] == 1:
-    explanation.append("🟡 **Обнаружена аномалия GPS/ГЛОНАСС** (скачок высоты или потеря спутников). Данные об уровне топлива в этот момент могут быть искажены. Вердикт модели может быть менее надежным.")
+if gnss_anomalies_count > 0:
+    explanation.append(f"🟡 **Обнаружены аномалии GPS/ГЛОНАСС** ({gnss_anomalies_count} раз в окне). Данные об уровне топлива в этот период могут быть искажены. Вердикт модели требует повышенной внимательности.")
 
 # 4. Проверка на ночной слив / разрыв связи
-if event_features['is_connection_lost'] == 1 and event_features['fuel_diff'] < -3.0:
-    explanation.append(f"🟡 Был разрыв связи. После восстановления уровень топлива оказался ниже на **{abs(event_features['fuel_diff']):.1f} л**, что характерно для 'ночного слива'.")
+if conn_lost_count > 0 and total_fuel_loss < -3.0:
+    explanation.append(f"🟡 Был разрыв связи. После восстановления уровень топлива оказался ниже на **{abs(total_fuel_loss):.1f} л**, что характерно для 'ночного слива'.")
 
 # 5. Если все чисто
 if not explanation:
-    explanation.append("🟢 **Признаки соответствуют нормальной эксплуатации**: техника могла двигаться, двигатель работал, резких необъяснимых просадок уровня топлива не зафиксировано. Модель классифицировала это как норму.")
+    explanation.append("🟢 **Признаки соответствуют нормальной эксплуатации**: в окне анализа не зафиксировано резких необъяснимых просадок уровня топлива при стоянке. Модель классифицировала это как норму.")
 
 # Выводим расшифровку списком
 for exp in explanation:
