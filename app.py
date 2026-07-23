@@ -376,15 +376,51 @@ if clicked_false:
 
 
 # ============================================================
-# ИСТОРИЯ ФИДБЕКА
+# ИСТОРИЯ ФИДБЕКА (теперь из PostgreSQL)
 # ============================================================
 
-with st.expander("📜 История собранных отзывов"):
-    if FEEDBACK_PATH.exists():
-        try:
-            df_fb = pd.read_csv(FEEDBACK_PATH, encoding="utf-8-sig")
-            st.dataframe(df_fb.tail(20), use_container_width=True, hide_index=True)
-        except Exception as e:
-            st.warning(f"Не удалось прочитать feedback.csv: {e}")
+from core.feedback import load_feedback, get_feedback_count
+
+with st.expander("📜 История собранных отзывов (из БД)"):
+    count = get_feedback_count()
+    if count > 0:
+        st.caption(f"Всего записей в базе данных: **{count}**")
+        
+        # Загружаем последние 50 записей
+        df_fb = load_feedback(limit=50)
+        
+        if not df_fb.empty:
+            # Показываем только ключевые колонки для удобства чтения оператором
+            # (признаки модели скрыты, они нужны только для обучения CatBoost)
+            display_cols = [
+                "feedback_ts", "object_name", "event_time", "user_verdict",
+                "system_label", "rule_reason", "total_drop", "ml_score_min"
+            ]
+            
+            # Фильтруем только те колонки, которые реально существуют в DataFrame
+            cols_to_show = [c for c in display_cols if c in df_fb.columns]
+            
+            # Переименуем колонки для красивого отображения на русском
+            rename_map = {
+                "feedback_ts": "Время отзыва",
+                "object_name": "Объект",
+                "event_time": "Время события",
+                "user_verdict": "Вердикт пользователя",
+                "system_label": "Вердикт системы",
+                "rule_reason": "Причина (правило)",
+                "total_drop": "Просадка (л)",
+                "ml_score_min": "ML score (min)"
+            }
+            df_display = df_fb[cols_to_show].rename(columns=rename_map)
+            
+            # Форматируем вердикт пользователя для наглядности
+            df_display["Вердикт пользователя"] = df_display["Вердикт пользователя"].map({
+                "real": "✅ Реальный",
+                "false": "❌ Ложный"
+            })
+            
+            st.dataframe(df_display, use_container_width=True, hide_index=True)
+        else:
+            st.info("Не удалось загрузить данные из БД.")
     else:
-        st.info("Пока нет собранных отзывов.")
+        st.info("Пока нет собранных отзывов в базе данных.")
