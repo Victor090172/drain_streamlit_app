@@ -298,6 +298,97 @@ options = [
 sel = st.selectbox("Выберите событие", range(len(options)), format_func=lambda i: options[i])
 v = verdicts[sel]
 
+# ============================================================
+# ОБЪЯСНЕНИЕ РЕШЕНИЯ МОДЕЛИ (XAI)
+# ============================================================
+st.markdown("---")
+st.markdown("### 🧠 Почему модель приняла такое решение?")
+st.caption("Анализ ключевых признаков телеметрии в момент события")
+
+# Берем значения признаков именно для строки события
+event_features = df_feat.loc[v["event_idx"]]
+
+# Создаем 4 колонки для компактного отображения метрик
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    st.metric(
+        "Скорость падения", 
+        f"{event_features['fuel_drop_rate']:.2f} л/мин",
+        delta="Высокая ⚠️" if event_features['fuel_drop_rate'] > 1.0 else "Норма",
+        delta_color="inverse" if event_features['fuel_drop_rate'] > 1.0 else "off"
+    )
+    st.metric(
+        "Падение за 10 мин", 
+        f"{event_features['total_drop_10min']:.1f} л",
+        delta="Подозрительно ⚠️" if event_features['total_drop_10min'] > 3.0 else "Норма",
+        delta_color="inverse" if event_features['total_drop_10min'] > 3.0 else "off"
+    )
+
+with col2:
+    st.metric(
+        "Монолитность падения", 
+        f"{int(event_features['consecutive_drops'])} точек",
+        help="Сколько точек подряд показывают строгое снижение уровня топлива"
+    )
+    st.metric(
+        "Глубина просадки (15 мин)", 
+        f"{event_features['drawdown_15min']:.1f} л"
+    )
+
+with col3:
+    st.metric(
+        "Скорость техники", 
+        f"{event_features['speed']:.1f} км/ч",
+        delta="Стоит ✅" if event_features['speed'] == 0 else "Движется",
+        delta_color="normal" if event_features['speed'] == 0 else "inverse"
+    )
+    st.metric(
+        "Двигатель", 
+        "ВКЛ" if event_features['is_engine_on'] == 1 else "ВЫКЛ"
+    )
+
+with col4:
+    st.metric(
+        "Аномалия GPS (РЭБ)", 
+        "⚠️ Обнаружена" if event_features['is_gnss_anomaly'] == 1 else "✅ Нет",
+        delta_color="inverse" if event_features['is_gnss_anomaly'] == 1 else "off"
+    )
+    st.metric(
+        "Разрыв связи", 
+        "⚠️ Был" if event_features['is_connection_lost'] == 1 else "✅ Нет",
+        delta_color="inverse" if event_features['is_connection_lost'] == 1 else "off"
+    )
+
+# Генерация текстовой расшифровки на основе признаков
+st.markdown("#### 📝 Расшифровка решения:")
+explanation = []
+
+# 1. Проверка на классический слив при стоянке
+if event_features['speed'] == 0 and event_features['total_drop_10min'] > 3.0:
+    explanation.append(f"🔴 **Техника стояла**, но зафиксирована просадка топлива **{event_features['total_drop_10min']:.1f} л** за 10 минут. Это основной триггер для подозрения на слив.")
+
+# 2. Проверка на монотонность (ключевой признак реального слива, а не шума)
+if event_features['consecutive_drops'] >= 3:
+    explanation.append(f"🔴 Зафиксировано монотонное (непрерывное) падение уровня в течение **{int(event_features['consecutive_drops'])} точек** подряд, что характерно для реального слива, а не для шума датчика.")
+
+# 3. Проверка на РЭБ / помехи
+if event_features['is_gnss_anomaly'] == 1:
+    explanation.append("🟡 **Обнаружена аномалия GPS/ГЛОНАСС** (скачок высоты или потеря спутников). Данные об уровне топлива в этот момент могут быть искажены. Вердикт модели может быть менее надежным.")
+
+# 4. Проверка на ночной слив / разрыв связи
+if event_features['is_connection_lost'] == 1 and event_features['fuel_diff'] < -3.0:
+    explanation.append(f"🟡 Был разрыв связи. После восстановления уровень топлива оказался ниже на **{abs(event_features['fuel_diff']):.1f} л**, что характерно для 'ночного слива'.")
+
+# 5. Если все чисто
+if not explanation:
+    explanation.append("🟢 **Признаки соответствуют нормальной эксплуатации**: техника могла двигаться, двигатель работал, резких необъяснимых просадок уровня топлива не зафиксировано. Модель классифицировала это как норму.")
+
+# Выводим расшифровку списком
+for exp in explanation:
+    st.markdown(f"- {exp}")
+
+
 # Для графика используем адаптивное окно
 main_window, window_type = _build_adaptive_window(df_feat, v["event_time"], v["event_idx"])
 event_time = v["event_time"]
