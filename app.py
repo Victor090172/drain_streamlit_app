@@ -327,28 +327,52 @@ st.plotly_chart(_plot_full_telemetry(df_feat, event_time), use_container_width=T
 
 st.markdown("---")
 st.markdown("#### Ваш вердикт по этому событию")
+st.caption("Отзыв будет записан в PostgreSQL вместе со всеми точками окна анализа для дообучения CatBoost.")
+
 b1, b2, _ = st.columns([1, 1, 4])
 with b1:
     clicked_real = st.button("✅ Реальный слив", key=f"real_{sel}", use_container_width=True)
 with b2:
     clicked_false = st.button("❌ Ложное срабатывание", key=f"false_{sel}", use_container_width=True)
 
+# Берём признаки в момент события (для обратной совместимости)
 features_row = df_feat.loc[v["event_idx"], router.features]
+
+# 🔧 ВАЖНО: берём ВЕСЬ окно анализа (адаптивное), чтобы записать все точки в БД
+main_window, _ = _build_adaptive_window(df_feat, v["event_time"], v["event_idx"])
 
 event_info = {
     "object_name": object_name,
     "event_time": event_time.isoformat(),
     "address": v["address"],
-    **{k: v[k] for k in ["label", "ml_detected", "rule_detected", "rule_reason",
+    "system_label": v["label"],
+    **{k: v[k] for k in ["ml_detected", "rule_detected", "rule_reason",
                          "ml_score_min", "anomaly_points_count", "total_drop", "gap_drop"]},
 }
 
 if clicked_real:
-    save_feedback(event_info, "real", features_row)
-    st.success("✅ Спасибо! Записано как «Реальный слив».")
+    ok = save_feedback(
+        event_info=event_info,
+        user_verdict="real",
+        features_row=features_row,
+        window_df=main_window,  # 🔧 Передаём ВСЁ окно для обучения CatBoost
+    )
+    if ok:
+        st.success(f"✅ Спасибо! Записано в БД: событие + {len(main_window)} точек окна.")
+    else:
+        st.error("⚠️ Не удалось сохранить в БД. Проверьте подключение к PostgreSQL.")
+
 if clicked_false:
-    save_feedback(event_info, "false", features_row)
-    st.success("❌ Спасибо! Записано как «Ложное срабатывание».")
+    ok = save_feedback(
+        event_info=event_info,
+        user_verdict="false",
+        features_row=features_row,
+        window_df=main_window,  # 🔧 Передаём ВСЁ окно
+    )
+    if ok:
+        st.success(f"❌ Спасибо! Записано в БД: событие + {len(main_window)} точек окна.")
+    else:
+        st.error("⚠️ Не удалось сохранить в БД. Проверьте подключение к PostgreSQL.")
 
 
 # ============================================================

@@ -15,8 +15,29 @@ FEEDBACK_PATH = BASE_DIR / "feedback.csv"
 # API FortMonitor
 # ============================================================
 API_BASE_URL = "https://glonassagro.com/"
-API_USERNAME = st.secrets.get("API_USERNAME") or os.getenv("API_USERNAME")
-API_PASSWORD = st.secrets.get("API_PASSWORD") or os.getenv("API_PASSWORD")
+
+# Читаем из secrets.toml (облако/локалка) или из переменных окружения
+API_USERNAME = st.secrets.get("API_USERNAME", os.getenv("API_USERNAME", ""))
+API_PASSWORD = st.secrets.get("API_PASSWORD", os.getenv("API_PASSWORD", ""))
+
+if not API_USERNAME or not API_PASSWORD:
+    st.error("❌ API credentials not configured! Please set secrets.")
+    st.stop()
+
+
+# ============================================================
+# PostgreSQL (для фидбека)
+# ============================================================
+PG_HOST = st.secrets.get("PG_HOST", os.getenv("PG_HOST", "localhost"))
+PG_PORT = int(st.secrets.get("PG_PORT", os.getenv("PG_PORT", "5432")))
+PG_DB = st.secrets.get("PG_DB", os.getenv("PG_DB", "drain_feedback"))
+PG_USER = st.secrets.get("PG_USER", os.getenv("PG_USER", "drain_app"))
+PG_PASSWORD = st.secrets.get("PG_PASSWORD", os.getenv("PG_PASSWORD", ""))
+
+if not PG_PASSWORD:
+    st.error("❌ PostgreSQL credentials not configured! Please set secrets.")
+    st.stop()
+
 
 # Проверка на случай, если секреты не настроены
 if not API_USERNAME or not API_PASSWORD:
