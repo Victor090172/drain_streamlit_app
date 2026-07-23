@@ -11,7 +11,7 @@ import streamlit as st
 import logging
 import urllib.parse
 
-from config import API_BASE_URL, API_USERNAME, API_PASSWORD, CRITICAL_SENSORS, OPTIONAL_SENSORS, ALL_SENSORS 
+from config import API_BASE_URL, API_USERNAME, API_PASSWORD, CRITICAL_SENSORS
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +208,7 @@ def fetch_telemetry_for_object(object_name: str,
         raise ValueError(
             f"Не удалось найти критичные датчики для '{object_name}'. "
             f"Проверьте, что у объекта есть датчики топлива и скорости."
+            f"Рекомендуемые названия для датчиков: Уровень топлива; Скорость."
         )
 
     min_time = pd.to_datetime(min_time_iso)
