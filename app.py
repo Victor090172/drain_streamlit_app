@@ -162,7 +162,7 @@ def _plot_full_telemetry(df_full: pd.DataFrame, event_time: pd.Timestamp) -> go.
 # ============================================================
 # SIDEBAR
 # ============================================================
-
+st.logo("Агропилот.png")
 with st.sidebar:
     st.title("🛢️ Детектор сливов")
     uploaded = st.file_uploader("Excel-отчёт о сливах", type=["xlsx", "xls"])
