@@ -6,7 +6,7 @@ from __future__ import annotations
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-
+from core.feedback import save_feedback, load_feedback, get_feedback_count
 from config import (
     WINDOW_BEFORE_MIN, WINDOW_AFTER_MIN,
     MIN_POINTS_IN_TIME_WINDOW, ROW_WINDOW_SIZE,
@@ -171,12 +171,16 @@ with st.sidebar:
         f"Мин. точек: {MIN_POINTS_IN_TIME_WINDOW} | "
         f"Строковое: ±{ROW_WINDOW_SIZE}"
     )
-    if FEEDBACK_PATH.exists():
-        try:
-            n_fb = sum(1 for _ in open(FEEDBACK_PATH, encoding="utf-8-sig")) - 1
-            st.caption(f"📝 Собрано отзывов: **{max(n_fb, 0)}**")
-        except Exception:
-            pass
+        # Счётчик отзывов из БД
+    try:
+      
+        n_fb = get_feedback_count()
+        if n_fb >= 0:
+            st.caption(f"📝 Собрано отзывов в БД: **{n_fb}**")
+        else:
+            st.caption("📝 БД недоступна")
+    except Exception:
+        st.caption("📝 Ошибка подключения к БД")
 
 
 # ============================================================
