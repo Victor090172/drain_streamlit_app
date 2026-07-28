@@ -19,12 +19,17 @@ FEATURE_COLUMNS = [
     "is_gsm_weak", "is_connection_lost", "is_engine_on", "speed",
 ]
 
+# Исправлено: количество колонок теперь совпадает с количеством передаваемых значений (21)
 INSERT_EVENT_SQL = """
     INSERT INTO feedback_events (
         object_name, event_time, address, user_verdict, system_label,
         ml_detected, rule_detected, rule_reason,
-        ml_score_min, anomaly_points_count, total_drop, gap_drop
-    ) VALUES %s
+        ml_score_min, anomaly_points_count, total_drop, gap_drop,
+        event_label, max_drop_in_window, drop_duration_min,
+        time_since_last_refuel_min, recovery_ratio,
+        hour_of_day, day_of_week,
+        fuel_level_before, fuel_level_after
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     RETURNING id
 """
 
@@ -40,6 +45,13 @@ INSERT_POINTS_SQL = """
         point_label
     ) VALUES %s
 """
+
+
+def _safe_float(val):
+    """Безопасное преобразование в float для psycopg2 (обрабатывает np.nan и None)."""
+    if val is None or pd.isna(val):
+        return None
+    return float(val)
 
 
 def _get_connection():
@@ -81,7 +93,7 @@ def save_feedback(
     user_verdict: str,
     features_row: pd.Series,
     window_df: pd.DataFrame | None = None,
-    context_window_hours: float = 2.0,  # НОВОЕ: сохранять ±2 часа контекста
+    context_window_hours: float = 2.0,
 ) -> bool:
     """
     Сохраняет событие + расширенный контекст для обучения CatBoost.
@@ -89,36 +101,28 @@ def save_feedback(
     try:
         with _get_connection() as conn:
             with conn.cursor() as cur:
-                # Рассчитать агрегированные признаки
                 event_label = 1 if user_verdict == "real" else 0
-                max_drop = abs(window_df["fuel_diff"].min()) if window_df is not None else 0
-                drop_duration = _calculate_drop_duration(window_df) if window_df is not None else 0
-                recovery_ratio = _calculate_recovery_ratio(window_df) if window_df is not None else 0
-# Безопасно парсим время из строки (isoformat) в pd.Timestamp
-                event_time_str = event_info.get("event_time")
+                
+                # Безопасный расчет агрегированных признаков
+                max_drop = _safe_float(abs(window_df["fuel_diff"].min())) if window_df is not None and "fuel_diff" in window_df else 0.0
+                drop_duration = _calculate_drop_duration(window_df) if window_df is not None else 0.0
+                recovery_ratio = _calculate_recovery_ratio(window_df) if window_df is not None else 0.0
+                
+                # Надежное извлечение часа и дня недели (работает и со строкой, и с pd.Timestamp)
+                event_time_val = event_info.get("event_time")
                 try:
-                    parsed_time = pd.to_datetime(event_time_str)
-                    hour_of_day = parsed_time.hour
-                    day_of_week = parsed_time.dayofweek
+                    parsed_time = pd.to_datetime(event_time_val)
+                    hour_of_day = int(parsed_time.hour)
+                    day_of_week = int(parsed_time.dayofweek)
                 except Exception:
                     hour_of_day = 0
                     day_of_week = 0
-                fuel_before = window_df["fuel_lvl"].iloc[0] if window_df is not None and len(window_df) > 0 else 0
-                fuel_after = window_df["fuel_lvl"].iloc[-1] if window_df is not None and len(window_df) > 0 else 0
+                    
+                fuel_before = _safe_float(window_df["fuel_lvl"].iloc[0]) if window_df is not None and len(window_df) > 0 else 0.0
+                fuel_after = _safe_float(window_df["fuel_lvl"].iloc[-1]) if window_df is not None and len(window_df) > 0 else 0.0
                 
-                # Вставить событие с агрегированными признаками
-                cur.execute("""
-                    INSERT INTO feedback_events (
-                        object_name, event_time, address, user_verdict, system_label,
-                        ml_detected, rule_detected, rule_reason,
-                        ml_score_min, anomaly_points_count, total_drop, gap_drop,
-                        event_label, max_drop_in_window, drop_duration_min,
-                        time_since_last_refuel_min, recovery_ratio,
-                        hour_of_day, day_of_week,
-                        fuel_level_before, fuel_level_after
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                """, (
+                # Вставка события (21 значение)
+                cur.execute(INSERT_EVENT_SQL, (
                     event_info.get("object_name", ""),
                     event_info.get("event_time", ""),
                     event_info.get("address", "") or None,
@@ -127,10 +131,10 @@ def save_feedback(
                     bool(event_info.get("ml_detected", False)),
                     bool(event_info.get("rule_detected", False)),
                     event_info.get("rule_reason", "") or None,
-                    float(event_info.get("ml_score_min", 0.0) or 0.0),
+                    _safe_float(event_info.get("ml_score_min")),
                     int(event_info.get("anomaly_points_count", 0) or 0),
-                    float(event_info.get("total_drop", 0.0) or 0.0),
-                    float(event_info.get("gap_drop", 0.0) or 0.0),
+                    _safe_float(event_info.get("total_drop")),
+                    _safe_float(event_info.get("gap_drop")),
                     event_label,
                     max_drop,
                     drop_duration,
@@ -143,22 +147,24 @@ def save_feedback(
                 ))
                 event_id = cur.fetchone()[0]
                 
-                # Вставить точки с расширенным контекстом
+                # Вставка точек с расширенным контекстом
                 if window_df is not None and not window_df.empty:
-                    # Сохраняем все точки в окне ±2 часа
                     points_rows = []
                     for _, row in window_df.iterrows():
                         label = _label_point(row, user_verdict)
-                        feat_vals = [float(row.get(col, 0) or 0) for col in FEATURE_COLUMNS]
+                        
+                        # Безопасное извлечение признаков
+                        feat_vals = [_safe_float(row.get(col)) for col in FEATURE_COLUMNS]
+                        
                         points_rows.append((
                             event_id,
                             row.get("datetime"),
                             *feat_vals,
                             int(row.get("is_anomaly", 1)),
-                            float(row.get("fuel_diff", 0) or 0),
-                            float(row.get("speed", 0) or 0),
-                            int(row.get("is_gnss_anomaly", 0) or 0),
-                            label,
+                            _safe_float(row.get("fuel_diff")),
+                            _safe_float(row.get("speed")),
+                            int(row.get("is_gnss_anomaly", 0)),
+                            int(label),
                         ))
                     execute_values(cur, INSERT_POINTS_SQL, points_rows, page_size=100)
                 
@@ -171,31 +177,36 @@ def save_feedback(
 
 def _calculate_drop_duration(window_df: pd.DataFrame) -> float:
     """Рассчитать длительность падения в минутах."""
-    if window_df is None or len(window_df) == 0:
-        return 0
+    if window_df is None or len(window_df) == 0 or "fuel_diff" not in window_df:
+        return 0.0
     drops = window_df[window_df["fuel_diff"] < -0.5]
     if len(drops) == 0:
-        return 0
-    return (drops["datetime"].max() - drops["datetime"].min()).total_seconds() / 60
+        return 0.0
+    return float((drops["datetime"].max() - drops["datetime"].min()).total_seconds() / 60)
 
 
 def _calculate_recovery_ratio(window_df: pd.DataFrame) -> float:
     """Рассчитать коэффициент восстановления уровня топлива."""
-    if window_df is None or len(window_df) < 10:
-        return 0
+    if window_df is None or len(window_df) < 10 or "fuel_lvl" not in window_df:
+        return 0.0
+    
     min_fuel = window_df["fuel_lvl"].min()
     max_fuel = window_df["fuel_lvl"].max()
-    if max_fuel == min_fuel:
-        return 0
-    # Найти точку минимума и посмотреть, насколько уровень восстановился после неё
+    
+    if pd.isna(min_fuel) or pd.isna(max_fuel) or max_fuel == min_fuel:
+        return 0.0
+        
     min_idx = window_df["fuel_lvl"].idxmin()
     after_min = window_df.loc[min_idx:]
+    
     if len(after_min) < 2:
-        return 0
+        return 0.0
+        
     final_fuel = after_min["fuel_lvl"].iloc[-1]
     recovery = final_fuel - min_fuel
     total_drop = max_fuel - min_fuel
-    return recovery / total_drop if total_drop > 0 else 0
+    
+    return float(recovery / total_drop) if total_drop > 0 else 0.0
 
 
 def get_feedback_count() -> int:
@@ -221,4 +232,71 @@ def load_feedback(limit: int = 100) -> pd.DataFrame:
             return pd.read_sql(query, conn)
     except Exception as e:
         logger.error(f"❌ Ошибка чтения feedback: {e}")
+        return pd.DataFrame()
+    
+
+def load_training_data(
+    min_feedback_date: str = None,
+    max_feedback_date: str = None,
+    include_user_false: bool = True,
+    include_user_real_normal_points: bool = True,
+) -> pd.DataFrame:
+    """
+    Загружает данные для переобучения Isolation Forest из БД.
+    """
+    try:
+        with _get_connection() as conn:
+            query = """
+                SELECT 
+                    p.feat_fuel_drop_rate,
+                    p.feat_fuel_volatility_15min,
+                    p.feat_drawdown_15min,
+                    p.feat_drawdown_30min,
+                    p.feat_total_drop_10min,
+                    p.feat_drop_duration_min,
+                    p.feat_drop_consistency,
+                    p.feat_consecutive_drops,
+                    p.feat_is_large_gap,
+                    p.feat_monotonic_drop_length,
+                    p.feat_time_diff_min,
+                    p.feat_is_gnss_anomaly,
+                    p.feat_is_gsm_weak,
+                    p.feat_is_connection_lost,
+                    p.feat_is_engine_on,
+                    p.feat_speed,
+                    p.point_label,
+                    e.user_verdict,
+                    e.feedback_ts
+                FROM feedback_points p
+                JOIN feedback_events e ON p.event_id = e.id
+                WHERE 1=1
+            """
+            
+            params = []
+            if min_feedback_date:
+                query += " AND e.feedback_ts >= %s"
+                params.append(min_feedback_date)
+            if max_feedback_date:
+                query += " AND e.feedback_ts <= %s"
+                params.append(max_feedback_date)
+            
+            conditions = []
+            if include_user_false:
+                conditions.append("e.user_verdict = 'false'")
+            if include_user_real_normal_points:
+                conditions.append("(e.user_verdict = 'real' AND p.point_label = 0)")
+            
+            if conditions:
+                query += " AND (" + " OR ".join(conditions) + ")"
+            
+            df = pd.read_sql(query, conn, params=params)
+            
+            rename_map = {col: col.replace("feat_", "") for col in df.columns if col.startswith("feat_")}
+            df = df.rename(columns=rename_map)
+            
+            logger.info(f"📊 Загружено {len(df)} точек для обучения")
+            return df
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка загрузки данных для обучения: {e}")
         return pd.DataFrame()
