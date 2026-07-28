@@ -94,8 +94,15 @@ def save_feedback(
                 max_drop = abs(window_df["fuel_diff"].min()) if window_df is not None else 0
                 drop_duration = _calculate_drop_duration(window_df) if window_df is not None else 0
                 recovery_ratio = _calculate_recovery_ratio(window_df) if window_df is not None else 0
-                hour_of_day = event_info.get("event_time", pd.Timestamp.now()).hour
-                day_of_week = event_info.get("event_time", pd.Timestamp.now()).dayofweek
+# Безопасно парсим время из строки (isoformat) в pd.Timestamp
+                event_time_str = event_info.get("event_time")
+                try:
+                    parsed_time = pd.to_datetime(event_time_str)
+                    hour_of_day = parsed_time.hour
+                    day_of_week = parsed_time.dayofweek
+                except Exception:
+                    hour_of_day = 0
+                    day_of_week = 0
                 fuel_before = window_df["fuel_lvl"].iloc[0] if window_df is not None and len(window_df) > 0 else 0
                 fuel_after = window_df["fuel_lvl"].iloc[-1] if window_df is not None and len(window_df) > 0 else 0
                 
