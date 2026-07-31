@@ -38,12 +38,6 @@ if not PG_PASSWORD:
     st.error("❌ PostgreSQL credentials not configured! Please set secrets.")
     st.stop()
 
-
-# Проверка на случай, если секреты не настроены
-if not API_USERNAME or not API_PASSWORD:
-    st.error(" API credentials not configured! Please set secrets.")
-    st.stop()
-
 # ============================================================
 # МАППИНГ ДАТЧИКОВ (fallback-списки названий)
 # ============================================================
@@ -140,3 +134,21 @@ EXPAND_HOURS_AFTER = 3
 SLOW_DRAIN_THRESHOLD_L = 3.5
 NIGHT_DRAIN_THRESHOLD_L = 5.0
 SUSPICIOUS_TOTAL_DROP_L = 3.0
+
+# ============================================================
+# КОНТЕКСТНОЕ ОКНО ДЛЯ CATBOOST (Этап 0)
+# ============================================================
+# Гибридный подход: max(временное, количественное)
+CONTEXT_HOURS_BEFORE = 24      # история для поиска заправки
+CONTEXT_HOURS_AFTER = 3        # восстановление после события
+CONTEXT_ROWS_BEFORE = 60       # для ночных сливов / выходных
+CONTEXT_ROWS_AFTER = 60
+
+# ============================================================
+# ПОРОГИ ОПРЕДЕЛЕНИЯ ЗАПРАВКИ
+# ============================================================
+REFUEL_THRESHOLD_L = 5.0           # минимальный рост уровня
+MAX_SPEED_FOR_REFUEL = 2.0         # стоянка (км/ч) — отсекает плескание
+REFUEL_STABILITY_RATIO = 0.5       # необратимость — отсекает наклон
+REFUEL_STABILITY_WINDOW_MIN = 30   # окно проверки стабилизации
+NO_REFUEL_VALUE = 999.0            # маркер "заправки не было"
