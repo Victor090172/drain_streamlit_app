@@ -166,7 +166,7 @@ def _plot_full_telemetry(df_full: pd.DataFrame, event_time: pd.Timestamp) -> go.
     return fig
 
 
-st.logo("images/Агропилот.png")
+st.logo("Агропилот.png")
 
 # ============================================================
 # SIDEBAR
