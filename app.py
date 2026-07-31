@@ -2,21 +2,28 @@
 Воспроизводит логику из ноутбука с адаптивным окном для ночных сливов.
 """
 from __future__ import annotations
-
+import sys
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from core.feedback import save_feedback, load_feedback, get_feedback_count
+from core.feedback import (
+    save_feedback,
+    save_telemetry_context,
+    detect_last_refuel,
+    load_feedback,
+    get_feedback_count,
+)
 from config import (
     WINDOW_BEFORE_MIN, WINDOW_AFTER_MIN,
     MIN_POINTS_IN_TIME_WINDOW, ROW_WINDOW_SIZE,
-    EXTENDED_WINDOW_ROWS, FEEDBACK_PATH, SENSOR_MAPPING,
+    EXTENDED_WINDOW_ROWS, SENSOR_MAPPING,
+    BASE_DIR,
 )
 from core.api import fetch_telemetry_for_object
 from core.telemetry import parse_drain_report
 from core.model_router import get_model_router
 from core.heuristics import make_verdict
-from core.feedback import save_feedback
+
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -159,10 +166,11 @@ def _plot_full_telemetry(df_full: pd.DataFrame, event_time: pd.Timestamp) -> go.
     return fig
 
 
+st.logo("images/Агропилот.png")
+
 # ============================================================
 # SIDEBAR
 # ============================================================
-st.logo("Агропилот.png")
 with st.sidebar:
     st.title("🛢️ Детектор сливов")
     uploaded = st.file_uploader("Excel-отчёт о сливах", type=["xlsx", "xls"])
@@ -171,7 +179,7 @@ with st.sidebar:
         f"Мин. точек: {MIN_POINTS_IN_TIME_WINDOW} | "
         f"Строковое: ±{ROW_WINDOW_SIZE}"
     )
-        # Счётчик отзывов из БД
+    # Счётчик отзывов из БД
     try:
       
         n_fb = get_feedback_count()
@@ -182,6 +190,77 @@ with st.sidebar:
     except Exception:
         st.caption("📝 Ошибка подключения к БД")
 
+
+# ============================================================
+# АДМИНИСТРИРОВАНИЕ
+# ============================================================
+    st.markdown("---")
+    st.subheader("⚙️ Администрирование")
+    
+    # Счётчик отзывов из БД
+    try:
+        from core.feedback import get_feedback_count
+        n_fb = get_feedback_count()
+        if n_fb >= 0:
+            st.caption(f"📝 Собрано отзывов в БД: **{n_fb}**")
+        else:
+            st.caption("📝 БД недоступна")
+    except Exception:
+        st.caption("📝 Ошибка подключения к БД")
+    
+    # Кнопка переобучения
+    if st.button("🔄 Переобучить модель", key="retrain", use_container_width=True):
+        with st.spinner("Переобучение модели... Это может занять несколько минут. Старая модель будет сохранена как бэкап."):
+            try:
+                import subprocess
+                import sys
+                
+                script_path = BASE_DIR / "scripts" / "retrain_model.py"
+                
+                if not script_path.exists():
+                    st.error(f"❌ Скрипт не найден: {script_path}")
+                else:
+                    result = subprocess.run(
+                        [sys.executable, str(script_path), "--notes", "Ручное переобучение из Streamlit"],
+                        capture_output=True,
+                        text=True,
+                        cwd=str(BASE_DIR),
+                        timeout=300
+                    )
+                    
+                    if result.returncode == 0:
+                        st.success("✅ Модель успешно переобучена! Предыдущая версия сохранена как бэкап.")
+                        st.code(result.stdout[-1000:], language="text")
+                        # Очищаем кэш, чтобы подгрузилась новая модель
+                        st.cache_resource.clear()
+                    else:
+                        st.error("❌ Ошибка при переобучении")
+                        st.code(result.stderr, language="text")
+                        
+            except subprocess.TimeoutExpired:
+                st.error("⏱️ Превышено время ожидания (5 минут)")
+            except Exception as e:
+                st.error(f"❌ Непредвиденная ошибка: {e}")
+    
+    # 🔧 НОВАЯ КНОПКА: Откат модели
+    st.markdown("---")
+    st.markdown("#### 🛡️ Управление версиями")
+    
+    if st.button("⏪ Откатить модель к предыдущей версии", key="rollback", use_container_width=True, type="secondary"):
+        with st.spinner("Выполняется откат..."):
+            from core.model_backup import rollback_to_latest_backup, get_available_backups
+            
+            # Показываем доступные бэкапы для информативности
+            backups = get_available_backups()
+            if backups:
+                st.info(f"Найдено бэкапов: {len(backups)}. Будет использован самый свежий: `{backups[0]['filename']}`")
+                
+            success, message = rollback_to_latest_backup()
+            if success:
+                st.success(message)
+                st.rerun() # Перезагружаем страницу, чтобы применить изменения
+            else:
+                st.error(message)
 
 # ============================================================
 # ОСНОВНАЯ ЛОГИКА
@@ -203,28 +282,26 @@ except Exception as e:
 st.subheader(f"Объект: **{object_name}**")
 st.caption(f"Найдено событий в отчёте: **{len(df_drains)}**")
 
-# 2. Тянем телеметрию (с кэшем)
+# 2. Тянем телеметрию (с расширенным окном для контекста CatBoost)
 try:
+    # Расширяем окно: -24ч до первого события (для поиска заправки)
+    # и +3ч после последнего (для восстановления уровня)
+    min_time = df_drains["Время"].min() - pd.Timedelta(hours=24)
+    max_time = df_drains["Время"].max() + pd.Timedelta(hours=3)
+
     logger.info(f"🔍 Запрашиваем телеметрию для объекта: '{object_name}'")
+    logger.info(f"🔍 Окно: {min_time} — {max_time}")
+
     df_telemetry = fetch_telemetry_for_object(
         object_name,
-        df_drains["Время"].min().isoformat(),
-        df_drains["Время"].max().isoformat(),
+        min_time.isoformat(),
+        max_time.isoformat(),
     )
-    if len(df_telemetry)< MIN_POINTS_IN_TIME_WINDOW:
-        min_time = df_drains["Время"].min() - pd.Timedelta(hours=6)
-        max_time = df_drains["Время"].max() + pd.Timedelta(hours=6)
-        
-        logger.info(f"🔍 Запрашиваем телеметрию для объекта: '{object_name}'")
-        df_telemetry = fetch_telemetry_for_object(
-            object_name,
-            min_time.isoformat(),
-            max_time.isoformat(),
-        )
 except Exception as e:
     st.error(f"Ошибка при запросе телеметрии: {e}")
     st.stop()
 
+# ⚠️ Эту проверку обязательно вернуть!
 if df_telemetry.empty:
     st.error("Телеметрия пуста. Проверьте имя объекта и даты.")
     st.stop()
@@ -266,27 +343,27 @@ for _, row in df_drains.iterrows():
     v["report_drain"] = row.get("Слив")
     v["address"] = row.get("Адрес", "")
     verdicts.append(v)
-
-df_verdicts = pd.DataFrame(verdicts)
-
-
-# 5. Таблица событий
-label_colors = {
-    "СЛИВ (ML)": "🔴",
-    "ПОДОЗРЕНИЕ НА СЛИВ (медленный слив/ночной слив)": "🟠",
-    "ПОДОЗРЕНИЕ НА СЛИВ (падение уровня)": "🟡",
-    "ЛОЖНЫЙ СЛИВ": "🟢",
-}
-
-df_show = df_verdicts.copy()
-df_show["Вердикт"] = df_show["label"].map(lambda x: f"{label_colors.get(x, '')} {x}")
-df_show["Время события"] = df_show["event_time"].dt.strftime("%d.%m.%Y %H:%M")
-df_show["Адрес"] = df_show["address"]
-df_show["Отчёт: слив, л"] = df_show["report_drain"]
-df_show["ML score (min)"] = df_show["ml_score_min"].round(4)
-df_show["Просадка в окне, л"] = df_show["total_drop"].round(1)
-df_show["Точек в окне"] = df_show["main_window_size"]
-df_show["Тип окна"] = df_show["window_type"].map({"time": "⏱️ время", "row": "📊 строки"})
+    
+    df_verdicts = pd.DataFrame(verdicts)
+    
+    
+    # 5. Таблица событий
+    label_colors = {
+        "СЛИВ (ML)": "🔴",
+        "ПОДОЗРЕНИЕ НА СЛИВ (медленный слив/ночной слив)": "🟠",
+        "ПОДОЗРЕНИЕ НА СЛИВ (падение уровня)": "🟡",
+        "ЛОЖНЫЙ СЛИВ": "🟢",
+    }
+    
+    df_show = df_verdicts.copy()
+    df_show["Вердикт"] = df_show["label"].map(lambda x: f"{label_colors.get(x, '')} {x}")
+    df_show["Время события"] = df_show["event_time"].dt.strftime("%d.%m.%Y %H:%M")
+    df_show["Адрес"] = df_show["address"]
+    df_show["Отчёт: слив, л"] = df_show["report_drain"]
+    df_show["ML score (min)"] = df_show["ml_score_min"].round(4)
+    df_show["Просадка в окне, л"] = df_show["total_drop"].round(1)
+    df_show["Точек в окне"] = df_show["main_window_size"]
+    df_show["Тип окна"] = df_show["window_type"].map({"time": "⏱️ время", "row": "📊 строки"})
 
 st.dataframe(
     df_show[["Вердикт", "Время события", "Адрес", "Отчёт: слив, л",
@@ -443,10 +520,12 @@ st.plotly_chart(_plot_full_telemetry(df_feat, event_time), use_container_width=T
 # ============================================================
 # КНОПКИ ОБРАТНОЙ СВЯЗИ
 # ============================================================
-
 st.markdown("---")
 st.markdown("#### Ваш вердикт по этому событию")
-st.caption("Отзыв будет записан в PostgreSQL вместе со всеми точками окна анализа для дообучения CatBoost.")
+st.caption(
+    "Отзыв будет записан в PostgreSQL: событие + точки окна + "
+    "полный контекст телеметрии (−24ч/+3ч) для обучения CatBoost."
+)
 
 b1, b2, _ = st.columns([1, 1, 4])
 with b1:
@@ -454,44 +533,65 @@ with b1:
 with b2:
     clicked_false = st.button("❌ Ложное срабатывание", key=f"false_{sel}", use_container_width=True)
 
-# Берём признаки в момент события (для обратной совместимости)
+# Признаки в момент события (для обратной совместимости)
 features_row = df_feat.loc[v["event_idx"], router.features]
 
-# 🔧 ВАЖНО: берём ВЕСЬ окно анализа (адаптивное), чтобы записать все точки в БД
+# Всё окно анализа (адаптивное) — для записи точек в БД
 main_window, _ = _build_adaptive_window(df_feat, v["event_time"], v["event_idx"])
+
+event_time = v["event_time"]
+event_idx = v["event_idx"]
+
+# 🔧 Расчёт времени с последней заправки по ПОЛНОЙ телеметрии
+time_since_refuel = detect_last_refuel(df_feat, event_time)
 
 event_info = {
     "object_name": object_name,
     "event_time": event_time.isoformat(),
     "address": v["address"],
     "system_label": v["label"],
-    **{k: v[k] for k in ["ml_detected", "rule_detected", "rule_reason",
-                         "ml_score_min", "anomaly_points_count", "total_drop", "gap_drop"]},
+    **{k: v[k] for k in [
+        "ml_detected", "rule_detected", "rule_reason",
+        "ml_score_min", "anomaly_points_count", "total_drop", "gap_drop",
+    ]},
 }
 
-if clicked_real:
-    ok = save_feedback(
+
+def _process_feedback(verdict: str) -> None:
+    """Единая обработка сохранения feedback + контекста телеметрии."""
+    # 1. Сохраняем событие + точки окна (возвращает event_id)
+    event_id = save_feedback(
         event_info=event_info,
-        user_verdict="real",
+        user_verdict=verdict,
         features_row=features_row,
-        window_df=main_window,  # 🔧 Передаём ВСЁ окно для обучения CatBoost
+        window_df=main_window,
+        time_since_last_refuel_min=time_since_refuel,
     )
-    if ok:
-        st.success(f"✅ Спасибо! Записано в БД: событие + {len(main_window)} точек окна.")
-    else:
+
+    if event_id < 0:
         st.error("⚠️ Не удалось сохранить в БД. Проверьте подключение к PostgreSQL.")
+        return
+
+    # 2. Сохраняем полную телеметрию (контекст для CatBoost)
+    ctx_ok = save_telemetry_context(event_id, df_feat, event_time, event_idx)
+
+    if ctx_ok:
+        st.success(
+            f"✅ Записано в БД: событие + {len(main_window)} точек окна "
+            f"+ контекст телеметрии. Время с заправки: {time_since_refuel:.0f} мин."
+        )
+    else:
+        st.warning(
+            f"⚠️ Событие сохранено (id={event_id}), "
+            f"но контекст телеметрии не записан. Проверьте таблицу telemetry_context."
+        )
+
+
+if clicked_real:
+    _process_feedback("real")
 
 if clicked_false:
-    ok = save_feedback(
-        event_info=event_info,
-        user_verdict="false",
-        features_row=features_row,
-        window_df=main_window,  # 🔧 Передаём ВСЁ окно
-    )
-    if ok:
-        st.success(f"❌ Спасибо! Записано в БД: событие + {len(main_window)} точек окна.")
-    else:
-        st.error("⚠️ Не удалось сохранить в БД. Проверьте подключение к PostgreSQL.")
+    _process_feedback("false")
 
 
 # ============================================================
