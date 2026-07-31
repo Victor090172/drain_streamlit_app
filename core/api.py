@@ -1,234 +1,645 @@
-"""API-клиент FortMonitor и функции загрузки телеметрии."""
+"""Streamlit-приложение для детекции сливов топлива.
+Воспроизводит логику из ноутбука с адаптивным окном для ночных сливов.
+"""
 from __future__ import annotations
-
-import datetime as dt
-from typing import Any, Dict, List, Optional
-
-import httpx
+import sys
 import pandas as pd
-import numpy as np
+import plotly.graph_objects as go
 import streamlit as st
+from core.feedback import (
+    save_feedback,
+    save_telemetry_context,
+    detect_last_refuel,
+    load_feedback,
+    get_feedback_count,
+)
+from config import (
+    WINDOW_BEFORE_MIN, WINDOW_AFTER_MIN,
+    MIN_POINTS_IN_TIME_WINDOW, ROW_WINDOW_SIZE,
+    EXTENDED_WINDOW_ROWS, SENSOR_MAPPING,
+    BASE_DIR,
+)
+from core.api import fetch_telemetry_for_object
+from core.telemetry import parse_drain_report
+from core.model_router import get_model_router
+from core.heuristics import make_verdict
+
 import logging
-import urllib.parse
 
-from config import API_BASE_URL, API_USERNAME, API_PASSWORD, CRITICAL_SENSORS
-
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class FortMonitorClient:
-    def __init__(self, base_url: str, username: str, password: str,
-                 api_version: str = "api/integration/v1/"):
-        self.base_url = base_url.rstrip("/") + "/"
-        self.api_version = api_version
-        self.username = username
-        self.password = password
-        self._client = httpx.Client(timeout=60.0)
-        self._session_id: Optional[str] = None
-        self._last_auth_time: Optional[dt.datetime] = None
 
-    def _get_headers(self) -> Dict[str, str]:
-        return {"SessionId": self._session_id} if self._session_id else {}
+st.set_page_config(page_title="Детектор сливов топлива", layout="wide")
 
-    def ensure_session(self) -> None:
-        now = dt.datetime.now()
-        if self._session_id is None or self._last_auth_time is None:
-            self._authenticate()
-        elif (now - self._last_auth_time) > dt.timedelta(minutes=25):
-            self._authenticate()
 
-    def _authenticate(self) -> None:
-        url = f"{self.base_url}{self.api_version}connect"
-        data = {"login": self.username, "password": self.password,
-                "lang": "ru-ru", "timezone": "0"}
-        response = self._client.get(url, params=data)
-        response.raise_for_status()
-        self._session_id = response.headers.get("SessionId")
-        date_str = response.headers.get("date", "")
-        if date_str:
-            sid_date = dt.datetime.strptime(date_str, "%a, %d %b %Y %H:%M:%S %Z")
-            self._last_auth_time = sid_date + dt.timedelta(hours=3)
+# ============================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================
+
+def _find_event_idx(df_feat: pd.DataFrame, event_time: pd.Timestamp) -> int:
+    """Находит индекс строки, ближайшей к event_time."""
+    if df_feat["datetime"].dt.tz is None and event_time.tz is not None:
+        event_time = event_time.tz_localize(None)
+    elif df_feat["datetime"].dt.tz is not None and event_time.tz is None:
+        event_time = event_time.tz_localize(df_feat["datetime"].dt.tz)
+    diffs = (df_feat["datetime"] - event_time).abs()
+    return int(diffs.idxmin())
+
+
+def _build_adaptive_window(df_feat: pd.DataFrame, event_time: pd.Timestamp, event_idx: int) -> tuple[pd.DataFrame, str]:
+    """
+    Адаптивное окно: как в ноутбуке.
+    
+    По умолчанию: временное окно [-10, +20] мин (cell 199 в ноутбуке).
+    Если в нём мало точек (< 10): переключаемся на строковое окно ±30 строк (cell 224).
+    
+    Возвращает: (window, window_type) где window_type = 'time' или 'row'
+    """
+    # 1. Пытаемся построить временное окно
+    if df_feat["datetime"].dt.tz is None and event_time.tz is not None:
+        event_time_naive = event_time.tz_localize(None)
+    elif df_feat["datetime"].dt.tz is not None and event_time.tz is None:
+        event_time_naive = event_time.tz_localize(df_feat["datetime"].dt.tz)
+    else:
+        event_time_naive = event_time
+
+    t_start = event_time_naive - pd.Timedelta(minutes=WINDOW_BEFORE_MIN)
+    t_end = event_time_naive + pd.Timedelta(minutes=WINDOW_AFTER_MIN)
+    mask = (df_feat["datetime"] >= t_start) & (df_feat["datetime"] <= t_end)
+    time_window = df_feat[mask].copy()
+
+    # 2. Проверяем, достаточно ли точек
+    if len(time_window) >= MIN_POINTS_IN_TIME_WINDOW:
+        return time_window, "time"
+    
+    # 3. Мало точек — переключаемся на строковое окно (для ночных сливов)
+    start = max(0, event_idx - ROW_WINDOW_SIZE)
+    end = min(len(df_feat) - 1, event_idx + ROW_WINDOW_SIZE)
+    row_window = df_feat.iloc[start:end + 1].copy()
+    return row_window, "row"
+
+
+def _build_extended_window(df_feat: pd.DataFrame, event_idx: int) -> pd.DataFrame:
+    """Расширенное окно: ±60 строк от события (для ночных сливов с большим gap)."""
+    start = max(0, event_idx - EXTENDED_WINDOW_ROWS)
+    end = min(len(df_feat) - 1, event_idx + EXTENDED_WINDOW_ROWS)
+    return df_feat.iloc[start:end + 1].copy()
+
+
+def _plot_event(window: pd.DataFrame, event_time: pd.Timestamp, window_type: str) -> go.Figure:
+    """График окна анализа с обозначением времени события."""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=window["datetime"], y=window["fuel_lvl"],
+        mode="lines+markers", name="Уровень топлива",
+        line=dict(color="#1f77b4"), marker=dict(size=4),
+    ))
+    anomalies = window[window["is_anomaly"] == -1]
+    if not anomalies.empty:
+        fig.add_trace(go.Scatter(
+            x=anomalies["datetime"], y=anomalies["fuel_lvl"],
+            mode="markers", name="Аномалия (ML)",
+            marker=dict(color="red", size=10, symbol="x"),
+        ))
+
+    x_line = event_time.to_pydatetime()
+    if hasattr(x_line, "tzinfo") and x_line.tzinfo is not None:
+        x_line = x_line.replace(tzinfo=None)
+
+    fig.add_vline(x=x_line, line_dash="dash", line_color="orange")
+    fig.add_annotation(
+        x=x_line, y=window["fuel_lvl"].max(),
+        text="Событие", showarrow=False, yanchor="bottom",
+        font=dict(color="orange", size=12),
+    )
+
+    title_suffix = " (строковое окно)" if window_type == "row" else " (временное окно)"
+    fig.update_layout(
+        title=f"Окно анализа: {len(window)} точек {title_suffix}",
+        xaxis_title="Время", yaxis_title="Уровень, л",
+        height=420, margin=dict(l=20, r=20, t=50, b=20),
+    )
+    return fig
+
+
+def _plot_full_telemetry(df_full: pd.DataFrame, event_time: pd.Timestamp) -> go.Figure:
+    """График всей телеметрии с обозначением времени события."""
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=df_full["datetime"], y=df_full["fuel_lvl"],
+        mode="lines", name="Уровень топлива",
+        line=dict(color="#1f77b4", width=1.5),
+    ))
+    
+    anomalies = df_full[df_full["is_anomaly"] == -1]
+    if not anomalies.empty:
+        fig.add_trace(go.Scatter(
+            x=anomalies["datetime"], y=anomalies["fuel_lvl"],
+            mode="markers", name="Аномалии (ML)",
+            marker=dict(color="red", size=6, symbol="x", opacity=0.6),
+        ))
+    
+    x_line = event_time.to_pydatetime()
+    if hasattr(x_line, "tzinfo") and x_line.tzinfo is not None:
+        x_line = x_line.replace(tzinfo=None)
+    
+    fig.add_vline(x=x_line, line_dash="dash", line_color="orange", line_width=2)
+    fig.add_annotation(
+        x=x_line, y=df_full["fuel_lvl"].max(),
+        text="Событие", showarrow=True, arrowhead=2,
+        arrowcolor="orange", font=dict(color="orange", size=12),
+        yanchor="bottom",
+    )
+    
+    fig.update_layout(
+        title=f"Полная телеметрия: {len(df_full)} точек | Событие в {event_time.strftime('%d.%m.%Y %H:%M')}",
+        xaxis_title="Время", yaxis_title="Уровень, л",
+        height=500, margin=dict(l=20, r=20, t=60, b=20),
+        hovermode="x unified",
+        xaxis=dict(
+            rangeslider=dict(visible=True),
+            type="date",
+        ),
+    )
+    return fig
+
+
+st.logo("images/Агропилот.png")
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+with st.sidebar:
+    st.title("🛢️ Детектор сливов")
+    uploaded = st.file_uploader("Excel-отчёт о сливах", type=["xlsx", "xls"])
+    st.caption(
+        f"Окно: ⏱️ −{WINDOW_BEFORE_MIN}/+{WINDOW_AFTER_MIN} мин | "
+        f"Мин. точек: {MIN_POINTS_IN_TIME_WINDOW} | "
+        f"Строковое: ±{ROW_WINDOW_SIZE}"
+    )
+    # Счётчик отзывов из БД
+    try:
+      
+        n_fb = get_feedback_count()
+        if n_fb >= 0:
+            st.caption(f"📝 Собрано отзывов в БД: **{n_fb}**")
         else:
-            self._last_auth_time = dt.datetime.now()
+            st.caption("📝 БД недоступна")
+    except Exception:
+        st.caption("📝 Ошибка подключения к БД")
 
-    def find_object(self, object_name: str) -> Optional[str]:
-        """Ищет ID объекта по имени. Возвращает ID или None."""
-        self.ensure_session()
-        url = f"{self.base_url}{self.api_version}object/find"
-        
-        #  Явно кодируем имя объекта для URL
-        encoded_name = urllib.parse.quote(object_name, safe='')
-        
-        # 🔧 Логирование для отладки
-        logger.info(f"🔍 Поиск объекта: '{object_name}' (encoded: '{encoded_name}')")
-        
-        response = self._client.post(
-            url, 
-            headers=self._get_headers(),
-            params={"paramName": "name", "paramValue": object_name},
-        )
-        
-        logger.info(f"📡 Ответ API: status={response.status_code}")
-        
-        data = response.json()
-        if data.get("objects"):
-            object_id = str(data["objects"][0]["id"])
-            logger.info(f"✅ Объект найден: ID={object_id}")
-            return object_id
-        
-        logger.warning(f"❌ Объект '{object_name}' не найден в FortMonitor")
-        return None
 
-    def get_sensor_params(self, object_id: str, sensor_mapping: dict) -> Optional[str]:
-        """
-        Формирует строку slist для запроса телеметрии.
-        
-        Для каждого признака перебирает список возможных названий датчиков.
-        Берёт первое найденное. Логирует отсутствующие датчики.
-        
-        Args:
-            object_id: ID объекта
-            sensor_mapping: словарь {признак: [список названий]}
-        
-        Returns:
-            Строку slist или None, если не найдены критичные датчики
-        """
-        self.ensure_session()
-        url = f"{self.base_url}{self.api_version}objsensorslist"
-        response = self._client.get(url, headers=self._get_headers(), params={"oid": object_id})
-        sensors = response.json().get("obj_sensors", [])
-        
-        # Индексируем доступные датчики по имени (lowercase для нечувствительности к регистру)
-        available_sensors = {}
-        for sensor in sensors:
-            name = sensor.get("name", "").lower().strip()
-            available_sensors[name] = sensor
-        
-        param_ids = []
-        missing_critical = []
-        missing_optional = []
-        
-        for feature_name, possible_names in sensor_mapping.items():
-            found = False
-            for name in possible_names:
-                name_lower = name.lower().strip()
-                if name_lower in available_sensors:
-                    sensor = available_sensors[name_lower]
-                    sid = sensor.get("sid", 0)
-                    pid = sensor.get("pid", 0)
-                    param_ids.append(f"s{sid}" if sid > 0 else f"p{pid}")
-                    found = True
-                    logger.info(f"✅ Датчик '{name}' найден для признака '{feature_name}'")
-                    break
-            
-            if not found:
-                if feature_name in CRITICAL_SENSORS:
-                    missing_critical.append(feature_name)
-                    logger.error(f"❌ КРИТИЧНЫЙ датчик '{feature_name}' не найден! "
-                               f"Искал: {possible_names}")
+# ============================================================
+# АДМИНИСТРИРОВАНИЕ
+# ============================================================
+    st.markdown("---")
+    st.subheader("⚙️ Администрирование")
+    
+    # Счётчик отзывов из БД
+    try:
+        from core.feedback import get_feedback_count
+        n_fb = get_feedback_count()
+        if n_fb >= 0:
+            st.caption(f"📝 Собрано отзывов в БД: **{n_fb}**")
+        else:
+            st.caption("📝 БД недоступна")
+    except Exception:
+        st.caption("📝 Ошибка подключения к БД")
+    
+    # Кнопка переобучения
+    if st.button("🔄 Переобучить модель", key="retrain", use_container_width=True):
+        with st.spinner("Переобучение модели... Это может занять несколько минут. Старая модель будет сохранена как бэкап."):
+            try:
+                import subprocess
+                import sys
+                
+                script_path = BASE_DIR / "scripts" / "retrain_model.py"
+                
+                if not script_path.exists():
+                    st.error(f"❌ Скрипт не найден: {script_path}")
                 else:
-                    missing_optional.append(feature_name)
-                    logger.warning(f"⚠️ Опциональный датчик '{feature_name}' не найден. "
-                                 f"Будут использованы дефолтные значения.")
-        
-        # Если не найдены критичные датчики — возвращаем None
-        if missing_critical:
-            logger.error(f"❌ Невозможно анализировать объект: отсутствуют критичные датчики: {missing_critical}")
-            return None
-        
-        if missing_optional:
-            logger.warning(f"⚠️ Часть опциональных датчиков отсутствует: {missing_optional}")
-        
-        return ",".join(param_ids) if param_ids else None
-
-    def get_telemetry(self, object_id: str, slist: str,
-                      date_from: str, date_to: str) -> Dict[str, Any]:
-        self.ensure_session()
-        url = f"{self.base_url}{self.api_version}objdata"
-        params = {"oid": object_id, "slist": slist, "from": date_from, "to": date_to}
-        response = self._client.get(url, headers=self._get_headers(), params=params)
-        response.raise_for_status()
-        return response.json()
-
-
-@st.cache_resource
-def get_api_client() -> FortMonitorClient:
-    """Singleton API-клиента на всё приложение."""
-    return FortMonitorClient(API_BASE_URL, API_USERNAME, API_PASSWORD)
-
-
-def process_telemetry_data(raw_data: Dict[str, Any], sensor_mapping: dict) -> pd.DataFrame:
-    """
-    Преобразует сырой ответ API в очищенный DataFrame.
-    Переименовывает колонки на основе фактически найденных датчиков.
-    """
-    col_names = ["Время"] + raw_data.get("column_names", [])
-    records = raw_data.get("obj_data", {}).get("records", [])
-    df = pd.DataFrame(records, columns=col_names)
-
-    df["Время"] = pd.to_datetime(df["Время"], format="%Y-%m-%d %H:%M:%S", errors="coerce")
-    df["Время"] = df["Время"].dt.tz_localize("UTC").dt.tz_convert("Europe/Moscow")
-
-    num_cols = [c for c in df.columns if c != "Время"]
-    for col in num_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # 🔧 Умное переименование: сопоставляем найденные колонки с признаками
-    rename_map = {"Время": "datetime"}
-    for col in num_cols:
-        col_lower = col.lower().strip()
-        for feature_name, possible_names in sensor_mapping.items():
-            if col_lower in [n.lower().strip() for n in possible_names]:
-                rename_map[col] = feature_name
-                break
+                    result = subprocess.run(
+                        [sys.executable, str(script_path), "--notes", "Ручное переобучение из Streamlit"],
+                        capture_output=True,
+                        text=True,
+                        cwd=str(BASE_DIR),
+                        timeout=300
+                    )
+                    
+                    if result.returncode == 0:
+                        st.success("✅ Модель успешно переобучена! Предыдущая версия сохранена как бэкап.")
+                        st.code(result.stdout[-1000:], language="text")
+                        # Очищаем кэш, чтобы подгрузилась новая модель
+                        st.cache_resource.clear()
+                    else:
+                        st.error("❌ Ошибка при переобучении")
+                        st.code(result.stderr, language="text")
+                        
+            except subprocess.TimeoutExpired:
+                st.error("⏱️ Превышено время ожидания (5 минут)")
+            except Exception as e:
+                st.error(f"❌ Непредвиденная ошибка: {e}")
     
-    df = df.rename(columns=rename_map)
-
-    # Округление уровня топлива (если он есть)
-    if "fuel_lvl" in df.columns:
-        df["fuel_lvl"] = np.ceil(df["fuel_lvl"] * 10) / 10
-
-    return df
-
-
-@st.cache_data(show_spinner="📡 Загружаем телеметрию через API...")
-def fetch_telemetry_for_object(object_name: str,
-                               min_time_iso: str,
-                               max_time_iso: str) -> pd.DataFrame:
-    """Тянет телеметрию за окно [min-3h, max+3h] для одного объекта."""
-    from config import SENSOR_MAPPING  # импорт внутри функции для избежания циклических зависимостей
+    # 🔧 НОВАЯ КНОПКА: Откат модели
+    st.markdown("---")
+    st.markdown("#### 🛡️ Управление версиями")
     
-    client = get_api_client()
-    object_id = client.find_object(object_name)
-    if not object_id:
-        raise ValueError(f"Объект '{object_name}' не найден в FortMonitor")
+    if st.button("⏪ Откатить модель к предыдущей версии", key="rollback", use_container_width=True, type="secondary"):
+        with st.spinner("Выполняется откат..."):
+            from core.model_backup import rollback_to_latest_backup, get_available_backups
+            
+            # Показываем доступные бэкапы для информативности
+            backups = get_available_backups()
+            if backups:
+                st.info(f"Найдено бэкапов: {len(backups)}. Будет использован самый свежий: `{backups[0]['filename']}`")
+                
+            success, message = rollback_to_latest_backup()
+            if success:
+                st.success(message)
+                st.rerun() # Перезагружаем страницу, чтобы применить изменения
+            else:
+                st.error(message)
 
-    # 🔧 Используем SENSOR_MAPPING вместо TARGET_SENSORS
-    slist = client.get_sensor_params(object_id, SENSOR_MAPPING)
-    if not slist:
-        raise ValueError(
-            f"Не удалось найти критичные датчики для '{object_name}'. "
-            f"Проверьте, что у объекта есть датчики топлива и скорости."
-            f"Рекомендуемые названия для датчиков: Уровень топлива; Скорость."
+# ============================================================
+# ОСНОВНАЯ ЛОГИКА
+# ============================================================
+
+if uploaded is None:
+    st.info("Загрузите Excel-отчёт, чтобы начать анализ.")
+    st.stop()
+
+file_bytes = uploaded.read()
+
+# 1. Парсим отчёт
+try:
+    object_name, df_drains = parse_drain_report(file_bytes)
+except Exception as e:
+    st.error(f"Не удалось разобрать отчёт: {e}")
+    st.stop()
+
+st.subheader(f"Объект: **{object_name}**")
+st.caption(f"Найдено событий в отчёте: **{len(df_drains)}**")
+
+# 2. Тянем телеметрию (с расширенным окном для контекста CatBoost)
+try:
+    # Расширяем окно: -24ч до первого события (для поиска заправки)
+    # и +3ч после последнего (для восстановления уровня)
+    min_time = df_drains["Время"].min() - pd.Timedelta(hours=24)
+    max_time = df_drains["Время"].max() + pd.Timedelta(hours=3)
+
+    logger.info(f"🔍 Запрашиваем телеметрию для объекта: '{object_name}'")
+    logger.info(f"🔍 Окно: {min_time} — {max_time}")
+
+    df_telemetry = fetch_telemetry_for_object(
+        object_name,
+        min_time.isoformat(),
+        max_time.isoformat(),
+    )
+except Exception as e:
+    st.error(f"Ошибка при запросе телеметрии: {e}")
+    st.stop()
+
+# ⚠️ Эту проверку обязательно вернуть!
+if df_telemetry.empty:
+    st.error("Телеметрия пуста. Проверьте имя объекта и даты.")
+    st.stop()
+    
+# Показываем, какие датчики были найдены
+available_cols = [c for c in df_telemetry.columns if c in SENSOR_MAPPING.keys()]
+missing_cols = [c for c in SENSOR_MAPPING.keys() if c not in df_telemetry.columns]
+
+if missing_cols:
+    st.warning(f"⚠️ У объекта отсутствуют датчики: {', '.join(missing_cols)}. "
+              f"Для них будут использованы дефолтные значения.")
+else:
+    st.success(f"✅ Все датчики найдены: {', '.join(available_cols)}")
+
+# 3. Считаем признаки + предсказания
+router = get_model_router()
+df_feat = router.predict(df_telemetry)
+
+# 4. Считаем вердикты по каждому событию (адаптивное окно)
+verdicts = []
+for _, row in df_drains.iterrows():
+    event_time = pd.to_datetime(row["Время"])
+    idx = _find_event_idx(df_feat, event_time)
+
+    # Адаптивное окно: временное или строковое
+    main_window, window_type = _build_adaptive_window(df_feat, event_time, idx)
+
+    # Расширенное окно: для ночного слива
+    extended_window = _build_extended_window(df_feat, idx)
+
+    v = make_verdict(main_window, extended_window)
+    v["event_idx"] = idx
+    v["event_time"] = event_time
+    v["main_window_size"] = len(main_window)
+    v["window_type"] = window_type
+    v["extended_window_size"] = len(extended_window)
+    v["report_level_before"] = row.get("Уровень до")
+    v["report_level_after"] = row.get("Уровень после")
+    v["report_drain"] = row.get("Слив")
+    v["address"] = row.get("Адрес", "")
+    verdicts.append(v)
+    
+    df_verdicts = pd.DataFrame(verdicts)
+    
+    
+    # 5. Таблица событий
+    label_colors = {
+        "СЛИВ (ML)": "🔴",
+        "ПОДОЗРЕНИЕ НА СЛИВ (медленный слив/ночной слив)": "🟠",
+        "ПОДОЗРЕНИЕ НА СЛИВ (падение уровня)": "🟡",
+        "ЛОЖНЫЙ СЛИВ": "🟢",
+    }
+    
+    df_show = df_verdicts.copy()
+    df_show["Вердикт"] = df_show["label"].map(lambda x: f"{label_colors.get(x, '')} {x}")
+    df_show["Время события"] = df_show["event_time"].dt.strftime("%d.%m.%Y %H:%M")
+    df_show["Адрес"] = df_show["address"]
+    df_show["Отчёт: слив, л"] = df_show["report_drain"]
+    df_show["ML score (min)"] = df_show["ml_score_min"].round(4)
+    df_show["Просадка в окне, л"] = df_show["total_drop"].round(1)
+    df_show["Точек в окне"] = df_show["main_window_size"]
+    df_show["Тип окна"] = df_show["window_type"].map({"time": "⏱️ время", "row": "📊 строки"})
+
+st.dataframe(
+    df_show[["Вердикт", "Время события", "Адрес", "Отчёт: слив, л",
+             "ML score (min)", "Просадка в окне, л", "Точек в окне", "Тип окна"]],
+    use_container_width=True, hide_index=True,
+)
+
+
+
+# ============================================================
+# ДЕТАЛЬНЫЙ ПРОСМОТР
+# ============================================================
+
+# ---------- Детальный просмотр ----------
+
+st.markdown("---")
+st.subheader("🔎 Детальный разбор события")
+
+options = [
+    f"{i+1}. {v['event_time'].strftime('%d.%m %H:%M')} — {v['label']} — {v['address']}"
+    for i, v in enumerate(verdicts)
+]
+sel = st.selectbox("Выберите событие", range(len(options)), format_func=lambda i: options[i])
+v = verdicts[sel]
+
+# 🔧 ПЕРЕСЧИТЫВАЕМ ОКНО ДЛЯ ВЫБРАННОГО СОБЫТИЯ
+main_window, window_type = _build_adaptive_window(df_feat, v["event_time"], v["event_idx"])
+event_time = v["event_time"]
+
+# ============================================================
+# ОБЪЯСНЕНИЕ РЕШЕНИЯ МОДЕЛИ (XAI) - ОБНОВЛЯЕТСЯ ПРИ СМЕНЕ СОБЫТИЯ
+# ============================================================
+st.markdown("---")
+st.markdown("### 🧠 Почему система приняла такое решение?")
+st.caption("Анализ агрегированных признаков телеметрии во всем окне анализа (не только в момент события)")
+
+# 🔧 ИСПОЛЬЗУЕМ main_window, который пересчитан для выбранного события
+window = main_window 
+
+# Рассчитываем агрегированные метрики по всему окну
+max_drop_10min = float(window['total_drop_10min'].max()) if 'total_drop_10min' in window.columns else 0.0
+max_drop_rate = float(window['fuel_drop_rate'].max()) if 'fuel_drop_rate' in window.columns else 0.0
+max_consecutive = int(window['consecutive_drops'].max()) if 'consecutive_drops' in window.columns else 0
+was_stationary = (window['speed'] == 0).mean() > 0.8  # Если >80% времени техника стояла
+gnss_anomalies_count = int(window['is_gnss_anomaly'].sum())
+conn_lost_count = int(window['is_connection_lost'].sum())
+
+# Считаем общую просадку топлива в окне (только отрицательные значения)
+total_fuel_loss = float(window[window['fuel_diff'] < 0]['fuel_diff'].sum()) if len(window[window['fuel_diff'] < 0]) > 0 else 0.0
+
+# Создаем 4 колонки для компактного отображения метрик окна
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    st.metric(
+        "Макс. просадка за 10 мин", 
+        f"{max_drop_10min:.1f} л",
+        delta="Подозрительно ⚠️" if max_drop_10min > 3.0 else "Норма",
+        delta_color="inverse" if max_drop_10min > 3.0 else "off"
+    )
+    st.metric(
+        "Макс. скорость падения", 
+        f"{max_drop_rate:.2f} л/мин",
+        delta="Высокая ⚠️" if max_drop_rate > 1.0 else "Норма",
+        delta_color="inverse" if max_drop_rate > 1.0 else "off"
+    )
+
+with col2:
+    st.metric(
+        "Макс. монолитность падения", 
+        f"{max_consecutive} точек",
+        help="Сколько точек подряд показывают строгое снижение уровня топлива"
+    )
+    st.metric(
+        "Общая просадка в окне", 
+        f"{abs(total_fuel_loss):.1f} л"
+    )
+
+with col3:
+    st.metric(
+        "Режим техники", 
+        "Стоянка ✅" if was_stationary else "В движении",
+        delta_color="normal" if was_stationary else "inverse"
+    )
+    st.metric(
+        "Двигатель", 
+        "ВКЛ" if window['is_engine_on'].max() == 1 else "ВЫКЛ"
+    )
+
+with col4:
+    st.metric(
+        "Аномалии GPS (РЭБ)", 
+        f"⚠️ {gnss_anomalies_count} раз" if gnss_anomalies_count > 0 else "✅ Нет",
+        delta_color="inverse" if gnss_anomalies_count > 0 else "off"
+    )
+    st.metric(
+        "Разрывы связи", 
+        f"⚠️ {conn_lost_count} раз" if conn_lost_count > 0 else "✅ Нет",
+        delta_color="inverse" if conn_lost_count > 0 else "off"
+    )
+
+# Генерация текстовой расшифровки на основе агрегированных признаков окна
+st.markdown("#### 📝 Расшифровка решения:")
+explanation = []
+
+# 1. Проверка на классический слив при стоянке (по максимуму в окне)
+if was_stationary and max_drop_10min > 3.0:
+    explanation.append(f"🔴 **Техника преимущественно стояла**, но в окне анализа зафиксирована просадка топлива **{max_drop_10min:.1f} л** за 10 минут. Это основной триггер для подозрения на слив.")
+
+# 2. Проверка на монотонность (ключевой признак реального слива, а не шума)
+if max_consecutive >= 3:
+    explanation.append(f" Зафиксировано монотонное (непрерывное) падение уровня в течение **{max_consecutive} точек** подряд, что характерно для реального слива, а не для шума датчика.")
+
+# 3. Проверка на РЭБ / помехи
+if gnss_anomalies_count > 0:
+    explanation.append(f"🟡 **Обнаружены аномалии GPS/ГЛОНАСС** ({gnss_anomalies_count} раз в окне). Данные об уровне топлива в этот период могут быть искажены. Вердикт модели требует повышенной внимательности.")
+
+# 4. Проверка на ночной слив / разрыв связи
+if conn_lost_count > 0 and total_fuel_loss < -3.0:
+    explanation.append(f"🟡 Был разрыв связи. После восстановления уровень топлива оказался ниже на **{abs(total_fuel_loss):.1f} л**, что характерно для 'ночного слива'.")
+
+# 5. Если все чисто
+if not explanation:
+    explanation.append("🟢 **Признаки соответствуют нормальной эксплуатации**: в окне анализа не зафиксировано резких необъяснимых просадок уровня топлива при стоянке. Модель классифицировала это как норму.")
+
+# Выводим расшифровку списком
+for exp in explanation:
+    st.markdown(f"- {exp}")
+
+
+# Для графика используем адаптивное окно
+main_window, window_type = _build_adaptive_window(df_feat, v["event_time"], v["event_idx"])
+event_time = v["event_time"]
+
+col1, col2 = st.columns([2, 1])
+with col1:
+    st.plotly_chart(_plot_event(main_window, event_time, window_type), use_container_width=True)
+with col2:
+    st.metric("Вердикт системы", v["label"])
+    st.metric("Аномальных точек (ML)", v["anomaly_points_count"])
+    st.metric("ML score (min)", f"{v['ml_score_min']:.4f}")
+    st.metric("Просадка в окне, л", f"{v['total_drop']:.1f}")
+    st.metric("Gap drawdown, л", f"{v['gap_drop']:.1f}")
+    st.caption(f"Окно: {v['main_window_size']} точек ({'⏱️ время' if v['window_type'] == 'time' else '📊 строки'}) | Gap: {v['extended_window_size']} точек")
+    if v["rule_reason"]:
+        st.info(f"**Правило:** {v['rule_reason']}")
+
+
+# График полной телеметрии
+st.markdown("#### 📊 Полная телеметрия (с возможностью масштабирования)")
+st.caption("Используйте инструменты выше графика для приближения/удаления. Двойной клик — сброс масштаба.")
+st.plotly_chart(_plot_full_telemetry(df_feat, event_time), use_container_width=True)
+
+# ============================================================
+# КНОПКИ ОБРАТНОЙ СВЯЗИ
+# ============================================================
+st.markdown("---")
+st.markdown("#### Ваш вердикт по этому событию")
+st.caption(
+    "Отзыв будет записан в PostgreSQL: событие + точки окна + "
+    "полный контекст телеметрии (−24ч/+3ч) для обучения CatBoost."
+)
+
+b1, b2, _ = st.columns([1, 1, 4])
+with b1:
+    clicked_real = st.button("✅ Реальный слив", key=f"real_{sel}", use_container_width=True)
+with b2:
+    clicked_false = st.button("❌ Ложное срабатывание", key=f"false_{sel}", use_container_width=True)
+
+# Признаки в момент события (для обратной совместимости)
+features_row = df_feat.loc[v["event_idx"], router.features]
+
+# Всё окно анализа (адаптивное) — для записи точек в БД
+main_window, _ = _build_adaptive_window(df_feat, v["event_time"], v["event_idx"])
+
+event_time = v["event_time"]
+event_idx = v["event_idx"]
+
+# 🔧 Расчёт времени с последней заправки по ПОЛНОЙ телеметрии
+time_since_refuel = detect_last_refuel(df_feat, event_time)
+
+event_info = {
+    "object_name": object_name,
+    "event_time": event_time.isoformat(),
+    "address": v["address"],
+    "system_label": v["label"],
+    **{k: v[k] for k in [
+        "ml_detected", "rule_detected", "rule_reason",
+        "ml_score_min", "anomaly_points_count", "total_drop", "gap_drop",
+    ]},
+}
+
+
+def _process_feedback(verdict: str) -> None:
+    """Единая обработка сохранения feedback + контекста телеметрии."""
+    # 1. Сохраняем событие + точки окна (возвращает event_id)
+    event_id = save_feedback(
+        event_info=event_info,
+        user_verdict=verdict,
+        features_row=features_row,
+        window_df=main_window,
+        time_since_last_refuel_min=time_since_refuel,
+    )
+
+    if event_id < 0:
+        st.error("⚠️ Не удалось сохранить в БД. Проверьте подключение к PostgreSQL.")
+        return
+
+    # 2. Сохраняем полную телеметрию (контекст для CatBoost)
+    ctx_ok = save_telemetry_context(event_id, df_feat, event_time, event_idx)
+
+    if ctx_ok:
+        st.success(
+            f"✅ Записано в БД: событие + {len(main_window)} точек окна "
+            f"+ контекст телеметрии. Время с заправки: {time_since_refuel:.0f} мин."
+        )
+    else:
+        st.warning(
+            f"⚠️ Событие сохранено (id={event_id}), "
+            f"но контекст телеметрии не записан. Проверьте таблицу telemetry_context."
         )
 
-    min_time = pd.to_datetime(min_time_iso)
-    max_time = pd.to_datetime(max_time_iso)
 
-    if min_time.tz is not None:
-        min_time_utc = min_time.tz_convert('UTC')
+if clicked_real:
+    _process_feedback("real")
+
+if clicked_false:
+    _process_feedback("false")
+
+
+# ============================================================
+# ИСТОРИЯ ФИДБЕКА (теперь из PostgreSQL)
+# ============================================================
+
+from core.feedback import load_feedback, get_feedback_count
+
+with st.expander("📜 История собранных отзывов (из БД)"):
+    count = get_feedback_count()
+    if count > 0:
+        st.caption(f"Всего записей в базе данных: **{count}**")
+        
+        # Загружаем последние 50 записей
+        df_fb = load_feedback(limit=50)
+        
+        if not df_fb.empty:
+            # Показываем только ключевые колонки для удобства чтения оператором
+            # (признаки модели скрыты, они нужны только для обучения CatBoost)
+            display_cols = [
+                "feedback_ts", "object_name", "event_time", "user_verdict",
+                "system_label", "rule_reason", "total_drop", "ml_score_min"
+            ]
+            
+            # Фильтруем только те колонки, которые реально существуют в DataFrame
+            cols_to_show = [c for c in display_cols if c in df_fb.columns]
+            
+            # Переименуем колонки для красивого отображения на русском
+            rename_map = {
+                "feedback_ts": "Время отзыва",
+                "object_name": "Объект",
+                "event_time": "Время события",
+                "user_verdict": "Вердикт пользователя",
+                "system_label": "Вердикт системы",
+                "rule_reason": "Причина (правило)",
+                "total_drop": "Просадка (л)",
+                "ml_score_min": "ML score (min)"
+            }
+            df_display = df_fb[cols_to_show].rename(columns=rename_map)
+            
+            # Форматируем вердикт пользователя для наглядности
+            df_display["Вердикт пользователя"] = df_display["Вердикт пользователя"].map({
+                "real": "✅ Реальный",
+                "false": "❌ Ложный"
+            })
+            
+            st.dataframe(df_display, use_container_width=True, hide_index=True)
+        else:
+            st.info("Не удалось загрузить данные из БД.")
     else:
-        min_time_utc = min_time.tz_localize('Europe/Moscow').tz_convert('UTC')
-
-    if max_time.tz is not None:
-        max_time_utc = max_time.tz_convert('UTC')
-    else:
-        max_time_utc = max_time.tz_localize('Europe/Moscow').tz_convert('UTC')
-
-    expanded_min = (min_time_utc - pd.Timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
-    expanded_max = (max_time_utc + pd.Timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
-
-    raw = client.get_telemetry(object_id, slist, expanded_min, expanded_max)
-    df = process_telemetry_data(raw, SENSOR_MAPPING)  # 🔧 передаём маппинг
-    df["object_id"] = object_id
-    return df
-
+        st.info("Пока нет собранных отзывов в базе данных.")
