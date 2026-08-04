@@ -17,12 +17,12 @@ from config import (
     WINDOW_BEFORE_MIN, WINDOW_AFTER_MIN,
     MIN_POINTS_IN_TIME_WINDOW, ROW_WINDOW_SIZE,
     EXTENDED_WINDOW_ROWS, SENSOR_MAPPING,
-    BASE_DIR,
+    BASE_DIR, SPEED_FILTER_THRESHOLD_KMH,
 )
 from core.api import fetch_telemetry_for_object
 from core.telemetry import parse_drain_report
 from core.model_router import get_model_router
-from core.heuristics import make_verdict
+from core.heuristics import make_verdict, post_process_verdict
 
 import logging
 
@@ -261,6 +261,7 @@ for _, row in df_drains.iterrows():
     extended_window = _build_extended_window(df_feat, idx)
 
     v = make_verdict(main_window, extended_window)
+    v = post_process_verdict(v, main_window, speed_threshold_kmh=SPEED_FILTER_THRESHOLD_KMH)
     v["event_idx"] = idx
     v["event_time"] = event_time
     v["main_window_size"] = len(main_window)
@@ -281,6 +282,7 @@ for _, row in df_drains.iterrows():
         "ПОДОЗРЕНИЕ НА СЛИВ (медленный слив/ночной слив)": "🟠",
         "ПОДОЗРЕНИЕ НА СЛИВ (падение уровня)": "🟡",
         "ЛОЖНЫЙ СЛИВ": "🟢",
+        "ВЕРОЯТНО ЛОЖНЫЙ СЛИВ (движение)": "🟢",
     }
     
     df_show = df_verdicts.copy()
