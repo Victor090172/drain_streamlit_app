@@ -341,56 +341,64 @@ was_stationary = (window['speed'] == 0).mean() > 0.8  # Если >80% време
 gnss_anomalies_count = int(window['is_gnss_anomaly'].sum())
 conn_lost_count = int(window['is_connection_lost'].sum())
 
+# 🚗 НОВЫЕ МЕТРИКИ ДВИЖЕНИЯ
+avg_speed = float(window['speed'].mean()) if 'speed' in window.columns else 0.0
+max_speed = float(window['speed'].max()) if 'speed' in window.columns else 0.0
+moving_share = float((window['speed'] > 2.0).mean()) if 'speed' in window.columns else 0.0  # доля времени в движении (>2 км/ч)
+is_moving = avg_speed > 15.0  # порог скоростного фильтра (болтанка)
+
 # Считаем общую просадку топлива в окне (только отрицательные значения)
 total_fuel_loss = float(window[window['fuel_diff'] < 0]['fuel_diff'].sum()) if len(window[window['fuel_diff'] < 0]) > 0 else 0.0
 
 # Создаем 4 колонки для компактного отображения метрик окна
 col1, col2, col3, col4 = st.columns(4)
 
+col1, col2, col3, col4 = st.columns(4)
 with col1:
     st.metric(
-        "Макс. просадка за 10 мин", 
+        "Макс. просадка за 10 мин",
         f"{max_drop_10min:.1f} л",
         delta="Подозрительно ⚠️" if max_drop_10min > 3.0 else "Норма",
         delta_color="inverse" if max_drop_10min > 3.0 else "off"
     )
     st.metric(
-        "Макс. скорость падения", 
+        "Макс. скорость падения",
         f"{max_drop_rate:.2f} л/мин",
         delta="Высокая ⚠️" if max_drop_rate > 1.0 else "Норма",
         delta_color="inverse" if max_drop_rate > 1.0 else "off"
     )
-
 with col2:
     st.metric(
-        "Макс. монолитность падения", 
+        "Макс. монолитность падения",
         f"{max_consecutive} точек",
         help="Сколько точек подряд показывают строгое снижение уровня топлива"
     )
     st.metric(
-        "Общая просадка в окне", 
+        "Общая просадка в окне",
         f"{abs(total_fuel_loss):.1f} л"
     )
-
 with col3:
     st.metric(
-        "Режим техники", 
-        "Стоянка ✅" if was_stationary else "В движении",
+        "Режим техники",
+        "Стоянка ✅" if was_stationary else "В движении 🚗",
         delta_color="normal" if was_stationary else "inverse"
     )
+    # 🚗 НОВАЯ МЕТРИКА: средняя скорость
     st.metric(
-        "Двигатель", 
-        "ВКЛ" if window['is_engine_on'].max() == 1 else "ВЫКЛ"
+        "Средняя скорость",
+        f"{avg_speed:.1f} км/ч",
+        delta="Болтанка ⚠️" if is_moving else "Стоянка",
+        delta_color="inverse" if is_moving else "normal",
+        help="При средней скорости > 15 км/ч падение уровня скорее всего вызвано болтанкой топлива, а не сливом"
     )
-
 with col4:
     st.metric(
-        "Аномалии GPS (РЭБ)", 
+        "Аномалии GPS (РЭБ)",
         f"⚠️ {gnss_anomalies_count} раз" if gnss_anomalies_count > 0 else "✅ Нет",
         delta_color="inverse" if gnss_anomalies_count > 0 else "off"
     )
     st.metric(
-        "Разрывы связи", 
+        "Разрывы связи",
         f"⚠️ {conn_lost_count} раз" if conn_lost_count > 0 else "✅ Нет",
         delta_color="inverse" if conn_lost_count > 0 else "off"
     )
@@ -398,6 +406,21 @@ with col4:
 # Генерация текстовой расшифровки на основе агрегированных признаков окна
 st.markdown("#### 📝 Расшифровка решения:")
 explanation = []
+
+# 🚗 0. Проверка на движение (болтанка топлива)
+if is_moving:
+    explanation.append(
+        f"🔵 Техника двигалась со средней скоростью **{avg_speed:.1f} км/ч** "
+        f"(в движении {moving_share*100:.0f}% времени, макс. {max_speed:.0f} км/ч). "
+        f"При движении падение уровня топлива с высокой вероятностью вызвано **болтанкой** "
+        f"(плескание топлива в баке), а не сливом. Слив в движении крайне маловероятен."
+    )
+elif not was_stationary:
+    explanation.append(
+        f"🟡 Техника двигалась с невысокой скоростью "
+        f"(средняя {avg_speed:.1f} км/ч, {moving_share*100:.0f}% времени в движении). "
+        f"Возможна как болтанка, так и слив при кратковременной остановке — требуется внимание."
+    )
 
 # 1. Проверка на классический слив при стоянке (по максимуму в окне)
 if was_stationary and max_drop_10min > 3.0:
