@@ -13,6 +13,73 @@ from config import (
     SUSPICIOUS_TOTAL_DROP_L,
 )
 
+def post_process_verdict(
+    verdict: dict,
+    main_window: pd.DataFrame,
+    speed_threshold_kmh: float = 15.0,
+) -> dict:
+    """
+    Пост-обработка вердикта: скоростной фильтр + информативное пояснение.
+    Если техника двигалась со скоростью выше порога — помечаем как
+    'ВЕРОЯТНО ЛОЖНЫЙ СЛИВ (движение)' с пояснением.
+    """
+    v = dict(verdict)  # копия, чтобы не менять оригинал
+
+    # ---------- Расчёт характеристик движения в окне ----------
+    avg_speed = 0.0
+    moving_share = 0.0
+    if main_window is not None and "speed" in main_window and len(main_window) > 0:
+        speeds = main_window["speed"].fillna(0)
+        avg_speed = float(speeds.mean())
+        moving_share = float((speeds > 2.0).mean())  # доля времени в движении
+
+    v["avg_speed"] = round(avg_speed, 1)
+    v["moving_share"] = round(moving_share, 2)
+
+    # ---------- Сбор дополнительных замечаний (РЭБ, связь) ----------
+    extra_notes = []
+    if main_window is not None and len(main_window) > 0:
+        if "is_gnss_anomaly" in main_window:
+            gnss_anomalies = int(main_window["is_gnss_anomaly"].fillna(0).sum())
+            if gnss_anomalies > 0:
+                extra_notes.append(
+                    f"Обнаружены аномалии GPS/ГЛОНАСС ({gnss_anomalies} раз) — "
+                    f"возможны искажения от РЭБ."
+                )
+        if "is_connection_lost" in main_window:
+            conn_lost = int(main_window["is_connection_lost"].fillna(0).sum())
+            if conn_lost > 0:
+                extra_notes.append(f"Зафиксированы разрывы связи ({conn_lost} раз).")
+
+    # ---------- Применение скоростного фильтра ----------
+    is_moving = avg_speed > speed_threshold_kmh
+    v["speed_filter_applied"] = is_moving
+
+    if is_moving:
+        # Меняем вердикт только если система подозревала слив
+        original_label = v.get("label", "")
+        if "ЛОЖНЫЙ" not in original_label:
+            v["label"] = "ВЕРОЯТНО ЛОЖНЫЙ СЛИВ (движение)"
+            v["rule_detected"] = True
+
+            reason_parts = [
+                f"Техника двигалась со средней скоростью {avg_speed:.1f} км/ч "
+                f"(в движении {moving_share*100:.0f}% времени). "
+                f"Слив в движении маловероятен — вероятна болтанка топлива в баке."
+            ]
+            reason_parts.extend(extra_notes)
+            v["rule_reason"] = " ".join(reason_parts)
+        else:
+            # Уже ложный — дополняем пояснение скоростью
+            existing = v.get("rule_reason") or ""
+            speed_note = f"Техника двигалась ({avg_speed:.1f} км/ч)."
+            v["rule_reason"] = (existing + " " + speed_note + " ".join(extra_notes)).strip()
+    else:
+        # Стоянка: если есть замечания по РЭБ — дополняем пояснение
+        if extra_notes and v.get("rule_reason") is not None:
+            v["rule_reason"] = (v.get("rule_reason") + " " + " ".join(extra_notes)).strip()
+
+    return v
 
 def check_slow_drain(window: pd.DataFrame) -> tuple[bool, str, float]:
     """Медленный слив: стоянка + хороший GPS + просадка > порога за 10 мин.
