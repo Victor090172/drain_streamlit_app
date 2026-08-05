@@ -18,7 +18,9 @@ from config import (
     MIN_POINTS_IN_TIME_WINDOW, ROW_WINDOW_SIZE,
     EXTENDED_WINDOW_ROWS, SENSOR_MAPPING,
     BASE_DIR, SPEED_FILTER_THRESHOLD_KMH,
+    CATBOOST_SHADOW_LOG, CATBOOST_SHOW_UI,   # ← новые флаги
 )
+from core.catboost_inference import predict_and_log_catboost   # ← новый импорт
 from core.api import fetch_telemetry_for_object
 from core.telemetry import parse_drain_report
 from core.model_router import get_model_router
