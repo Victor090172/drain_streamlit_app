@@ -25,6 +25,12 @@ from core.api import fetch_telemetry_for_object
 from core.telemetry import parse_drain_report
 from core.model_router import get_model_router
 from core.heuristics import make_verdict, post_process_verdict
+# CatBoost теневой режим (может отсутствовать, если модель не задеплоена)
+try:
+    from core.catboost_inference import predict_and_log_catboost
+    CATBOOST_SHADOW_AVAILABLE = True
+except ImportError:
+    CATBOOST_SHADOW_AVAILABLE = False
 
 import logging
 
@@ -513,8 +519,8 @@ event_info = {
 
 
 def _process_feedback(verdict: str) -> None:
-    """Единая обработка сохранения feedback + контекста телеметрии."""
-    # 1. Сохраняем событие + точки окна (возвращает event_id)
+    """Единая обработка: feedback + контекст + теневой CatBoost."""
+    # 1. Сохраняем событие + точки окна
     event_id = save_feedback(
         event_info=event_info,
         user_verdict=verdict,
@@ -522,7 +528,6 @@ def _process_feedback(verdict: str) -> None:
         window_df=main_window,
         time_since_last_refuel_min=time_since_refuel,
     )
-
     if event_id < 0:
         st.error("⚠️ Не удалось сохранить в БД. Проверьте подключение к PostgreSQL.")
         return
@@ -530,6 +535,24 @@ def _process_feedback(verdict: str) -> None:
     # 2. Сохраняем полную телеметрию (контекст для CatBoost)
     ctx_ok = save_telemetry_context(event_id, df_feat, event_time, event_idx)
 
+    # 3. 🤖 Теневое логирование CatBoost (пользователь НЕ видит)
+    if CATBOOST_SHADOW_AVAILABLE:
+        try:
+            predict_and_log_catboost(
+                df_feat=df_feat,
+                event_time=event_time,
+                event_idx=event_idx,
+                main_window=main_window,
+                verdict=v,
+                event_id=event_id,
+                object_name=object_name,
+                user_verdict=verdict,
+                time_since_refuel=time_since_refuel,
+            )
+        except Exception as e:
+            logger.warning(f"CatBoost shadow mode: {e}")
+
+    # 4. Финальное сообщение пользователю (без упоминания CatBoost)
     if ctx_ok:
         st.success(
             f"✅ Записано в БД: событие + {len(main_window)} точек окна "
@@ -540,14 +563,6 @@ def _process_feedback(verdict: str) -> None:
             f"⚠️ Событие сохранено (id={event_id}), "
             f"но контекст телеметрии не записан. Проверьте таблицу telemetry_context."
         )
-
-
-if clicked_real:
-    _process_feedback("real")
-
-if clicked_false:
-    _process_feedback("false")
-
 
 # ============================================================
 # ИСТОРИЯ ФИДБЕКА (теперь из PostgreSQL)
