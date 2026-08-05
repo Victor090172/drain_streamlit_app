@@ -1,10 +1,17 @@
+# === Core ===
 streamlit>=1.30.0
 pandas>=2.0.0
 numpy>=1.24.0
-httpx>=0.25.0
-scikit-learn>=1.3.0
-joblib>=1.3.0
 plotly>=5.18.0
-openpyxl>=3.1.0
+
+# === ML модели ===
+scikit-learn>=1.3.0
+catboost>=1.2.0
+joblib>=1.3.0
+
+# === База данных ===
 psycopg2-binary>=2.9.9
-urllib3>=2.0.0
+
+# === Файлы ===
+openpyxl>=3.1.0
+pyarrow>=14.0.0
