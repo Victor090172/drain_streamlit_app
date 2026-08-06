@@ -200,7 +200,11 @@ def evaluate_sensor(df_feat: pd.DataFrame) -> dict:
 
 
 def save_sensor_health(object_name: str, result: dict) -> bool:
-    """Сохраняет результат оценки в БД для накопления статистики."""
+    """
+    Сохраняет результат оценки в БД для накопления статистики.
+    При повторной загрузке того же отчёта обновляет существующую запись
+    вместо создания дубля (ON CONFLICT DO UPDATE).
+    """
     try:
         with _get_connection() as conn:
             with conn.cursor() as cur:
@@ -213,11 +217,33 @@ def save_sensor_health(object_name: str, result: dict) -> bool:
                         avg_volatility, max_volatility, spike_count,
                         connection_lost_count, large_gap_count, max_time_gap_min,
                         gnss_anomaly_count, min_fuel_level, max_fuel_level,
-                        estimated_capacity, negative_level_count, recommendations
+                        estimated_capacity, negative_level_count, recommendations,
+                        updated_at
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
                     )
+                    ON CONFLICT (object_name, period_start, period_end) DO UPDATE SET
+                        data_points = EXCLUDED.data_points,
+                        period_hours = EXCLUDED.period_hours,
+                        noise_score = EXCLUDED.noise_score,
+                        continuity_score = EXCLUDED.continuity_score,
+                        plausibility_score = EXCLUDED.plausibility_score,
+                        stability_score = EXCLUDED.stability_score,
+                        overall_health = EXCLUDED.overall_health,
+                        avg_volatility = EXCLUDED.avg_volatility,
+                        max_volatility = EXCLUDED.max_volatility,
+                        spike_count = EXCLUDED.spike_count,
+                        connection_lost_count = EXCLUDED.connection_lost_count,
+                        large_gap_count = EXCLUDED.large_gap_count,
+                        max_time_gap_min = EXCLUDED.max_time_gap_min,
+                        gnss_anomaly_count = EXCLUDED.gnss_anomaly_count,
+                        min_fuel_level = EXCLUDED.min_fuel_level,
+                        max_fuel_level = EXCLUDED.max_fuel_level,
+                        estimated_capacity = EXCLUDED.estimated_capacity,
+                        negative_level_count = EXCLUDED.negative_level_count,
+                        recommendations = EXCLUDED.recommendations,
+                        updated_at = NOW()
                 """, (
                     object_name,
                     result.get("period_start"), result.get("period_end"),
