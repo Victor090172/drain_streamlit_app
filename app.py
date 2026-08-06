@@ -25,6 +25,7 @@ from core.api import fetch_telemetry_for_object
 from core.telemetry import parse_drain_report
 from core.model_router import get_model_router
 from core.heuristics import make_verdict, post_process_verdict
+from core.sensor_health import evaluate_sensor, save_sensor_health, load_health_ranking
 # CatBoost теневой режим (может отсутствовать, если модель не задеплоена)
 try:
     from core.catboost_inference import predict_and_log_catboost
@@ -256,6 +257,13 @@ else:
 router = get_model_router()
 df_feat = router.predict(df_telemetry)
 
+# ============================================================
+# ОЦЕНКА ЗДОРОВЬЯ ДАТЧИКА (Этап 1: наблюдение, не влияет на детекцию)
+# ============================================================
+sensor_health = evaluate_sensor(df_feat)
+if sensor_health is not None:
+    save_sensor_health(object_name, sensor_health)
+
 # 4. Считаем вердикты по каждому событию (адаптивное окно)
 verdicts = []
 for _, row in df_drains.iterrows():
@@ -282,26 +290,171 @@ for _, row in df_drains.iterrows():
     verdicts.append(v)
     
     df_verdicts = pd.DataFrame(verdicts)
-    
+
+# ============================================================
+# 🩺 ДАШБОРД ЗДОРОВЬЯ ДАТЧИКА
+# ============================================================
+if sensor_health is not None:
+    st.markdown("---")
+    st.markdown("### 🩺 Здоровье датчика уровня топлива")
+    st.caption(
+        "Экспериментальная оценка качества показаний ДУТ по загруженной телеметрии. "
+        "Не влияет на вердикты о сливах — только наблюдение и накопление статистики."
+    )
+
+    # Вспомогательная функция для цветовой индикации
+    def _health_delta(score: float):
+        """Возвращает (текст, цвет) в зависимости от значения метрики."""
+        if score >= 70:
+            return "Хорошо", "normal"
+        elif score >= 40:
+            return "Внимание", "off"
+        else:
+            return "Проблема", "inverse"
+
+    # ---------- Интегральная оценка ----------
+    overall = sensor_health.get("overall_health", 0)
+    hcol1, hcol2 = st.columns([1, 3])
+    with hcol1:
+        ov_delta, ov_color = _health_delta(overall)
+        st.metric(
+            "Общая оценка",
+            f"{overall:.0f} / 100",
+            delta=ov_delta,
+            delta_color=ov_color,
+            help="Взвешенная сумма четырёх аспектов качества данных ДУТ",
+        )
+    with hcol2:
+        st.progress(int(overall) / 100)
+
+    # ---------- Четыре аспекта с подсказками ----------
+    ac1, ac2, ac3, ac4 = st.columns(4)
+
+    noise_score = sensor_health.get("noise_score", 0)
+    nd, nc = _health_delta(noise_score)
+    ac1.metric(
+        "Шум / волатильность", f"{noise_score:.0f}",
+        delta=nd, delta_color=nc,
+        help="Насколько 'дрожат' показания уровня. Низкое значение = нестабильный сигнал, болтанка или неисправность датчика.",
+    )
+
+    cont_score = sensor_health.get("continuity_score", 0)
+    cd, cc = _health_delta(cont_score)
+    ac2.metric(
+        "Непрерывность данных", f"{cont_score:.0f}",
+        delta=cd, delta_color=cc,
+        help="Полнота поступления данных. Низкое значение = частые разрывы связи, в которых могут скрываться сливы.",
+    )
+
+    plaus_score = sensor_health.get("plausibility_score", 0)
+    pd_, pc = _health_delta(plaus_score)
+    ac3.metric(
+        "Правдоподобность", f"{plaus_score:.0f}",
+        delta=pd_, delta_color=pc,
+        help="Физическая возможность показаний. Низкое значение = отрицательный уровень или превышение ёмкости бака, нужна калибровка.",
+    )
+
+    stab_score = sensor_health.get("stability_score", 0)
+    sd, sc = _health_delta(stab_score)
+    ac4.metric(
+        "Стабильность", f"{stab_score:.0f}",
+        delta=sd, delta_color=sc,
+        help="Отсутствие резких скачков уровня. Низкое значение = много резких изменений за точку, ненадёжные данные.",
+    )
+
+    # ---------- Подробное описание метрик ----------
+    with st.expander("❓ Что означают эти метрики?"):
+        st.markdown("""
+#### 🔊 Шум / волатильность
+Измеряет, насколько сильно «дрожат» показания уровня топлива в течение коротких интервалов.
+
+- **На что влияет:** высокая волатильность создаёт ложные «падения» уровня, которые детектор может принять за слив.
+- **Высокое значение (70–100):** показания плавные и предсказуемые — датчик работает корректно.
+- **Низкое значение (0–40):** уровень прыгает вверх-вниз без реальной причины. Возможные причины:
+  - отсутствие или плохая настройка фильтрации ДУТ;
+  - болтанка топлива в баке при движении;
+  - неисправность датчика.
+
+#### 📡 Непрерывность данных
+Показывает, насколько полно и без пропусков поступают данные от датчика.
+
+- **На что влияет:** в разрывах данных могут быть **скрыты реальные сливы** (т.н. «ночной слив» — связь пропадает, а после восстановления уровень уже ниже).
+- **Высокое значение (70–100):** данные поступают стабильно, без пропусков.
+- **Низкое значение (0–40):** частые разрывы связи. Возможные причины:
+  - проблемы с GSM-антенной или питанием трекера;
+  - воздействие РЭБ (радиоэлектронной борьбы);
+  - потеря питания в ночное время.
+
+#### ⚖️ Правдоподобность
+Проверяет, физически ли возможны показания датчика.
+
+- **На что влияет:** неправдоподобные значения делают все расчёты недостоверными и указывают на серьёзные проблемы с датчиком.
+- **Высокое значение (70–100):** все показания в физически возможных пределах.
+- **Низкое значение (0–40):** обнаружены аномалии:
+  - отрицательный уровень топлива;
+  - значения выше оценочной ёмкости бака;
+  - **рекомендация:** требуется калибровка или проверка ДУТ.
+
+#### 📈 Стабильность
+Отслеживает резкие скачки уровня топлива за одну точку данных. В отличие от «шума» (мелкие частые колебания), скачки — это большие изменения за короткий момент.
+
+- **На что влияет:** резкие скачки искажают картину и могут быть приняты за слив или заправку.
+- **Высокое значение (70–100):** изменения уровня плавные, соответствуют реальным процессам (расход, заправка).
+- **Низкое значение (0–40):** много резких скачков. Возможные причины:
+  - неисправность датчика;
+  - сильные помехи;
+  - некорректная передача данных.
+
+---
+**Шкала оценки:** 🟢 70–100 — хорошо | 🟡 40–69 — требует внимания | 🔴 0–39 — проблема
+        """)
+
+    # ---------- Детали ----------
+    with st.expander("🔍 Детали оценки"):
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Точек данных", sensor_health.get("data_points", 0))
+        d2.metric("Период, ч", f"{sensor_health.get('period_hours', 0):.1f}")
+        d3.metric("Средняя волатильность, л", f"{sensor_health.get('avg_volatility', 0):.2f}")
+        d4.metric("Резких скачков", sensor_health.get("spike_count", 0))
+
+        d5, d6, d7, d8 = st.columns(4)
+        d5.metric("Разрывов связи", sensor_health.get("connection_lost_count", 0))
+        d6.metric("Аномалий GPS", sensor_health.get("gnss_anomaly_count", 0))
+        d7.metric("Мин. уровень, л", f"{sensor_health.get('min_fuel_level', 0):.1f}")
+        d8.metric("Макс. уровень, л", f"{sensor_health.get('max_fuel_level', 0):.1f}")
+
+        st.caption(
+            f"Оценочная ёмкость бака (эвристика): **{sensor_health.get('estimated_capacity', 0):.0f} л** "
+            f"(по максимальному наблюдаемому уровню)"
+        )
+
+    # ---------- Рекомендации ----------
+    st.markdown("#### 💡 Рекомендации")
+    for rec in sensor_health.get("recommendations", []):
+        st.markdown(f"- {rec}")
+
+
     
     # 5. Таблица событий
-    label_colors = {
-        "СЛИВ (ML)": "🔴",
-        "ПОДОЗРЕНИЕ НА СЛИВ (медленный слив/ночной слив)": "🟠",
-        "ПОДОЗРЕНИЕ НА СЛИВ (падение уровня)": "🟡",
-        "ЛОЖНЫЙ СЛИВ": "🟢",
-        "ВЕРОЯТНО ЛОЖНЫЙ СЛИВ (движение)": "🟢",
-    }
-    
-    df_show = df_verdicts.copy()
-    df_show["Вердикт"] = df_show["label"].map(lambda x: f"{label_colors.get(x, '')} {x}")
-    df_show["Время события"] = df_show["event_time"].dt.strftime("%d.%m.%Y %H:%M")
-    df_show["Адрес"] = df_show["address"]
-    df_show["Отчёт: слив, л"] = df_show["report_drain"]
-    df_show["ML score (min)"] = df_show["ml_score_min"].round(4)
-    df_show["Просадка в окне, л"] = df_show["total_drop"].round(1)
-    df_show["Точек в окне"] = df_show["main_window_size"]
-    df_show["Тип окна"] = df_show["window_type"].map({"time": "⏱️ время", "row": "📊 строки"})
+st.markdown("---")
+st.markdown("### Оценка вероятности слива топлива")
+label_colors = {
+    "СЛИВ (ML)": "🔴",
+    "ПОДОЗРЕНИЕ НА СЛИВ (медленный слив/ночной слив)": "🟠",
+    "ПОДОЗРЕНИЕ НА СЛИВ (падение уровня)": "🟡",
+    "ЛОЖНЫЙ СЛИВ": "🟢",
+    "ВЕРОЯТНО ЛОЖНЫЙ СЛИВ (движение)": "🟢",
+}
+
+df_show = df_verdicts.copy()
+df_show["Вердикт"] = df_show["label"].map(lambda x: f"{label_colors.get(x, '')} {x}")
+df_show["Время события"] = df_show["event_time"].dt.strftime("%d.%m.%Y %H:%M")
+df_show["Адрес"] = df_show["address"]
+df_show["Отчёт: слив, л"] = df_show["report_drain"]
+df_show["ML score (min)"] = df_show["ml_score_min"].round(4)
+df_show["Просадка в окне, л"] = df_show["total_drop"].round(1)
+df_show["Точек в окне"] = df_show["main_window_size"]
+df_show["Тип окна"] = df_show["window_type"].map({"time": "⏱️ время", "row": "📊 строки"})
 
 st.dataframe(
     df_show[["Вердикт", "Время события", "Адрес", "Отчёт: слив, л",
@@ -613,3 +766,32 @@ with st.expander("📜 История собранных отзывов (из Б
             st.info("Не удалось загрузить данные из БД.")
     else:
         st.info("Пока нет собранных отзывов в базе данных.")
+
+
+       
+# ============================================================
+# 🏆 РЕЙТИНГ ОБЪЕКТОВ ПО КАЧЕСТВУ ДАТЧИКОВ (из накопленной статистики)
+# ============================================================
+with st.expander("🩺 Рейтинг объектов по здоровью датчиков (накопленная статистика)"):
+    df_ranking = load_health_ranking(limit_objects=50)
+    if not df_ranking.empty:
+        df_ranking = df_ranking.rename(columns={
+            "object_name": "Объект",
+            "overall_health": "Здоровье",
+            "created_at": "Последняя оценка",
+            "noise_score": "Шум",
+            "continuity_score": "Непрерывность",
+            "plausibility_score": "Правдоподобность",
+            "stability_score": "Стабильность",
+        })
+        display_rank_cols = [c for c in [
+            "Объект", "Здоровье", "Шум", "Непрерывность",
+            "Правдоподобность", "Стабильность", "Последняя оценка",
+        ] if c in df_ranking.columns]
+        st.dataframe(df_ranking[display_rank_cols], use_container_width=True, hide_index=True)
+        st.caption(
+            "Объекты отсортированы по возрастанию здоровья датчика "
+            "(худшие сверху). Показана последняя оценка для каждого объекта."
+        )
+    else:
+        st.info("Пока нет накопленных данных о здоровье датчиков.")
