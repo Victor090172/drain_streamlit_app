@@ -294,144 +294,145 @@ for _, row in df_drains.iterrows():
 # ============================================================
 # 🩺 ДАШБОРД ЗДОРОВЬЯ ДАТЧИКА
 # ============================================================
-if sensor_health is not None:
-    st.markdown("---")
-    st.markdown("### 🩺 Здоровье датчика уровня топлива")
-    st.caption(
-        "Экспериментальная оценка качества показаний ДУТ по загруженной телеметрии. "
-        "Не влияет на вердикты о сливах — только наблюдение и накопление статистики."
-    )
-
-    # Вспомогательная функция для цветовой индикации
-    def _health_delta(score: float):
-        """Возвращает (текст, цвет) в зависимости от значения метрики."""
-        if score >= 70:
-            return "Хорошо", "normal"
-        elif score >= 40:
-            return "Внимание", "off"
-        else:
-            return "Проблема", "inverse"
-
-    # ---------- Интегральная оценка ----------
-    overall = sensor_health.get("overall_health", 0)
-    hcol1, hcol2 = st.columns([1, 3])
-    with hcol1:
-        ov_delta, ov_color = _health_delta(overall)
-        st.metric(
-            "Общая оценка",
-            f"{overall:.0f} / 100",
-            delta=ov_delta,
-            delta_color=ov_color,
-            help="Взвешенная сумма четырёх аспектов качества данных ДУТ",
-        )
-    with hcol2:
-        st.progress(int(overall) / 100)
-
-    # ---------- Четыре аспекта с подсказками ----------
-    ac1, ac2, ac3, ac4 = st.columns(4)
-
-    noise_score = sensor_health.get("noise_score", 0)
-    nd, nc = _health_delta(noise_score)
-    ac1.metric(
-        "Шум / волатильность", f"{noise_score:.0f}",
-        delta=nd, delta_color=nc,
-        help="Насколько 'дрожат' показания уровня. Низкое значение = нестабильный сигнал, болтанка или неисправность датчика.",
-    )
-
-    cont_score = sensor_health.get("continuity_score", 0)
-    cd, cc = _health_delta(cont_score)
-    ac2.metric(
-        "Непрерывность данных", f"{cont_score:.0f}",
-        delta=cd, delta_color=cc,
-        help="Полнота поступления данных. Низкое значение = частые разрывы связи, в которых могут скрываться сливы.",
-    )
-
-    plaus_score = sensor_health.get("plausibility_score", 0)
-    pd_, pc = _health_delta(plaus_score)
-    ac3.metric(
-        "Правдоподобность", f"{plaus_score:.0f}",
-        delta=pd_, delta_color=pc,
-        help="Физическая возможность показаний. Низкое значение = отрицательный уровень или превышение ёмкости бака, нужна калибровка.",
-    )
-
-    stab_score = sensor_health.get("stability_score", 0)
-    sd, sc = _health_delta(stab_score)
-    ac4.metric(
-        "Стабильность", f"{stab_score:.0f}",
-        delta=sd, delta_color=sc,
-        help="Отсутствие резких скачков уровня. Низкое значение = много резких изменений за точку, ненадёжные данные.",
-    )
-
-    # ---------- Подробное описание метрик ----------
-    with st.expander("❓ Что означают эти метрики?"):
-        st.markdown("""
-#### 🔊 Шум / волатильность
-Измеряет, насколько сильно «дрожат» показания уровня топлива в течение коротких интервалов.
-
-- **На что влияет:** высокая волатильность создаёт ложные «падения» уровня, которые детектор может принять за слив.
-- **Высокое значение (70–100):** показания плавные и предсказуемые — датчик работает корректно.
-- **Низкое значение (0–40):** уровень прыгает вверх-вниз без реальной причины. Возможные причины:
-  - отсутствие или плохая настройка фильтрации ДУТ;
-  - болтанка топлива в баке при движении;
-  - неисправность датчика.
-
-#### 📡 Непрерывность данных
-Показывает, насколько полно и без пропусков поступают данные от датчика.
-
-- **На что влияет:** в разрывах данных могут быть **скрыты реальные сливы** (т.н. «ночной слив» — связь пропадает, а после восстановления уровень уже ниже).
-- **Высокое значение (70–100):** данные поступают стабильно, без пропусков.
-- **Низкое значение (0–40):** частые разрывы связи. Возможные причины:
-  - проблемы с GSM-антенной или питанием трекера;
-  - воздействие РЭБ (радиоэлектронной борьбы);
-  - потеря питания в ночное время.
-
-#### ⚖️ Правдоподобность
-Проверяет, физически ли возможны показания датчика.
-
-- **На что влияет:** неправдоподобные значения делают все расчёты недостоверными и указывают на серьёзные проблемы с датчиком.
-- **Высокое значение (70–100):** все показания в физически возможных пределах.
-- **Низкое значение (0–40):** обнаружены аномалии:
-  - отрицательный уровень топлива;
-  - значения выше оценочной ёмкости бака;
-  - **рекомендация:** требуется калибровка или проверка ДУТ.
-
-#### 📈 Стабильность
-Отслеживает резкие скачки уровня топлива за одну точку данных. В отличие от «шума» (мелкие частые колебания), скачки — это большие изменения за короткий момент.
-
-- **На что влияет:** резкие скачки искажают картину и могут быть приняты за слив или заправку.
-- **Высокое значение (70–100):** изменения уровня плавные, соответствуют реальным процессам (расход, заправка).
-- **Низкое значение (0–40):** много резких скачков. Возможные причины:
-  - неисправность датчика;
-  - сильные помехи;
-  - некорректная передача данных.
-
----
-**Шкала оценки:** 🟢 70–100 — хорошо | 🟡 40–69 — требует внимания | 🔴 0–39 — проблема
-        """)
-
-    # ---------- Детали ----------
-    with st.expander("🔍 Детали оценки"):
-        d1, d2, d3, d4 = st.columns(4)
-        d1.metric("Точек данных", sensor_health.get("data_points", 0))
-        d2.metric("Период, ч", f"{sensor_health.get('period_hours', 0):.1f}")
-        d3.metric("Средняя волатильность, л", f"{sensor_health.get('avg_volatility', 0):.2f}")
-        d4.metric("Резких скачков", sensor_health.get("spike_count", 0))
-
-        d5, d6, d7, d8 = st.columns(4)
-        d5.metric("Разрывов связи", sensor_health.get("connection_lost_count", 0))
-        d6.metric("Аномалий GPS", sensor_health.get("gnss_anomaly_count", 0))
-        d7.metric("Мин. уровень, л", f"{sensor_health.get('min_fuel_level', 0):.1f}")
-        d8.metric("Макс. уровень, л", f"{sensor_health.get('max_fuel_level', 0):.1f}")
-
+with st.expander("🩺 Здоровье датчика уровня топлива"):
+    if sensor_health is not None:
+        st.markdown("---")
+        st.markdown("### 🩺 Здоровье датчика уровня топлива")
         st.caption(
-            f"Оценочная ёмкость бака (эвристика): **{sensor_health.get('estimated_capacity', 0):.0f} л** "
-            f"(по максимальному наблюдаемому уровню)"
+            "Экспериментальная оценка качества показаний ДУТ по загруженной телеметрии. "
+            "Не влияет на вердикты о сливах — только наблюдение и накопление статистики."
         )
-
-    # ---------- Рекомендации ----------
-    st.markdown("#### 💡 Рекомендации")
-    for rec in sensor_health.get("recommendations", []):
-        st.markdown(f"- {rec}")
+    
+        # Вспомогательная функция для цветовой индикации
+        def _health_delta(score: float):
+            """Возвращает (текст, цвет) в зависимости от значения метрики."""
+            if score >= 70:
+                return "Хорошо", "normal"
+            elif score >= 40:
+                return "Внимание", "off"
+            else:
+                return "Проблема", "inverse"
+    
+        # ---------- Интегральная оценка ----------
+        overall = sensor_health.get("overall_health", 0)
+        hcol1, hcol2 = st.columns([1, 3])
+        with hcol1:
+            ov_delta, ov_color = _health_delta(overall)
+            st.metric(
+                "Общая оценка",
+                f"{overall:.0f} / 100",
+                delta=ov_delta,
+                delta_color=ov_color,
+                help="Взвешенная сумма четырёх аспектов качества данных ДУТ",
+            )
+        with hcol2:
+            st.progress(int(overall) / 100)
+    
+        # ---------- Четыре аспекта с подсказками ----------
+        ac1, ac2, ac3, ac4 = st.columns(4)
+    
+        noise_score = sensor_health.get("noise_score", 0)
+        nd, nc = _health_delta(noise_score)
+        ac1.metric(
+            "Шум / волатильность", f"{noise_score:.0f}",
+            delta=nd, delta_color=nc,
+            help="Насколько 'дрожат' показания уровня. Низкое значение = нестабильный сигнал, болтанка или неисправность датчика.",
+        )
+    
+        cont_score = sensor_health.get("continuity_score", 0)
+        cd, cc = _health_delta(cont_score)
+        ac2.metric(
+            "Непрерывность данных", f"{cont_score:.0f}",
+            delta=cd, delta_color=cc,
+            help="Полнота поступления данных. Низкое значение = частые разрывы связи, в которых могут скрываться сливы.",
+        )
+    
+        plaus_score = sensor_health.get("plausibility_score", 0)
+        pd_, pc = _health_delta(plaus_score)
+        ac3.metric(
+            "Правдоподобность", f"{plaus_score:.0f}",
+            delta=pd_, delta_color=pc,
+            help="Физическая возможность показаний. Низкое значение = отрицательный уровень или превышение ёмкости бака, нужна калибровка.",
+        )
+    
+        stab_score = sensor_health.get("stability_score", 0)
+        sd, sc = _health_delta(stab_score)
+        ac4.metric(
+            "Стабильность", f"{stab_score:.0f}",
+            delta=sd, delta_color=sc,
+            help="Отсутствие резких скачков уровня. Низкое значение = много резких изменений за точку, ненадёжные данные.",
+        )
+    
+        # ---------- Подробное описание метрик ----------
+        with st.expander("❓ Что означают эти метрики?"):
+            st.markdown("""
+    #### 🔊 Шум / волатильность
+    Измеряет, насколько сильно «дрожат» показания уровня топлива в течение коротких интервалов.
+    
+    - **На что влияет:** высокая волатильность создаёт ложные «падения» уровня, которые детектор может принять за слив.
+    - **Высокое значение (70–100):** показания плавные и предсказуемые — датчик работает корректно.
+    - **Низкое значение (0–40):** уровень прыгает вверх-вниз без реальной причины. Возможные причины:
+      - отсутствие или плохая настройка фильтрации ДУТ;
+      - болтанка топлива в баке при движении;
+      - неисправность датчика.
+    
+    #### 📡 Непрерывность данных
+    Показывает, насколько полно и без пропусков поступают данные от датчика.
+    
+    - **На что влияет:** в разрывах данных могут быть **скрыты реальные сливы** (т.н. «ночной слив» — связь пропадает, а после восстановления уровень уже ниже).
+    - **Высокое значение (70–100):** данные поступают стабильно, без пропусков.
+    - **Низкое значение (0–40):** частые разрывы связи. Возможные причины:
+      - проблемы с GSM-антенной или питанием трекера;
+      - воздействие РЭБ (радиоэлектронной борьбы);
+      - потеря питания в ночное время.
+    
+    #### ⚖️ Правдоподобность
+    Проверяет, физически ли возможны показания датчика.
+    
+    - **На что влияет:** неправдоподобные значения делают все расчёты недостоверными и указывают на серьёзные проблемы с датчиком.
+    - **Высокое значение (70–100):** все показания в физически возможных пределах.
+    - **Низкое значение (0–40):** обнаружены аномалии:
+      - отрицательный уровень топлива;
+      - значения выше оценочной ёмкости бака;
+      - **рекомендация:** требуется калибровка или проверка ДУТ.
+    
+    #### 📈 Стабильность
+    Отслеживает резкие скачки уровня топлива за одну точку данных. В отличие от «шума» (мелкие частые колебания), скачки — это большие изменения за короткий момент.
+    
+    - **На что влияет:** резкие скачки искажают картину и могут быть приняты за слив или заправку.
+    - **Высокое значение (70–100):** изменения уровня плавные, соответствуют реальным процессам (расход, заправка).
+    - **Низкое значение (0–40):** много резких скачков. Возможные причины:
+      - неисправность датчика;
+      - сильные помехи;
+      - некорректная передача данных.
+    
+    ---
+    **Шкала оценки:** 🟢 70–100 — хорошо | 🟡 40–69 — требует внимания | 🔴 0–39 — проблема
+            """)
+    
+        # ---------- Детали ----------
+        with st.expander("🔍 Детали оценки"):
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("Точек данных", sensor_health.get("data_points", 0))
+            d2.metric("Период, ч", f"{sensor_health.get('period_hours', 0):.1f}")
+            d3.metric("Средняя волатильность, л", f"{sensor_health.get('avg_volatility', 0):.2f}")
+            d4.metric("Резких скачков", sensor_health.get("spike_count", 0))
+    
+            d5, d6, d7, d8 = st.columns(4)
+            d5.metric("Разрывов связи", sensor_health.get("connection_lost_count", 0))
+            d6.metric("Аномалий GPS", sensor_health.get("gnss_anomaly_count", 0))
+            d7.metric("Мин. уровень, л", f"{sensor_health.get('min_fuel_level', 0):.1f}")
+            d8.metric("Макс. уровень, л", f"{sensor_health.get('max_fuel_level', 0):.1f}")
+    
+            st.caption(
+                f"Оценочная ёмкость бака (эвристика): **{sensor_health.get('estimated_capacity', 0):.0f} л** "
+                f"(по максимальному наблюдаемому уровню)"
+            )
+    
+        # ---------- Рекомендации ----------
+        st.markdown("#### 💡 Рекомендации")
+        for rec in sensor_health.get("recommendations", []):
+            st.markdown(f"- {rec}")
 
 
     
@@ -469,167 +470,168 @@ st.dataframe(
 # ============================================================
 
 # ---------- Детальный просмотр ----------
-
-st.markdown("---")
-st.subheader("🔎 Детальный разбор события")
-
-options = [
-    f"{i+1}. {v['event_time'].strftime('%d.%m %H:%M')} — {v['label']} — {v['address']}"
-    for i, v in enumerate(verdicts)
-]
-sel = st.selectbox("Выберите событие", range(len(options)), format_func=lambda i: options[i])
-v = verdicts[sel]
-
-# 🔧 ПЕРЕСЧИТЫВАЕМ ОКНО ДЛЯ ВЫБРАННОГО СОБЫТИЯ
-main_window, window_type = _build_adaptive_window(df_feat, v["event_time"], v["event_idx"])
-event_time = v["event_time"]
-
-# ============================================================
-# ОБЪЯСНЕНИЕ РЕШЕНИЯ МОДЕЛИ (XAI) - ОБНОВЛЯЕТСЯ ПРИ СМЕНЕ СОБЫТИЯ
-# ============================================================
-st.markdown("---")
-st.markdown("### 🧠 Почему система приняла такое решение?")
-st.caption("Анализ агрегированных признаков телеметрии во всем окне анализа (не только в момент события)")
-
-# 🔧 ИСПОЛЬЗУЕМ main_window, который пересчитан для выбранного события
-window = main_window 
-
-# Рассчитываем агрегированные метрики по всему окну
-max_drop_10min = float(window['total_drop_10min'].max()) if 'total_drop_10min' in window.columns else 0.0
-max_drop_rate = float(window['fuel_drop_rate'].max()) if 'fuel_drop_rate' in window.columns else 0.0
-max_consecutive = int(window['consecutive_drops'].max()) if 'consecutive_drops' in window.columns else 0
-was_stationary = (window['speed'] == 0).mean() > 0.8  # Если >80% времени техника стояла
-gnss_anomalies_count = int(window['is_gnss_anomaly'].sum())
-conn_lost_count = int(window['is_connection_lost'].sum())
-
-# 🚗 НОВЫЕ МЕТРИКИ ДВИЖЕНИЯ
-avg_speed = float(window['speed'].mean()) if 'speed' in window.columns else 0.0
-max_speed = float(window['speed'].max()) if 'speed' in window.columns else 0.0
-moving_share = float((window['speed'] > 2.0).mean()) if 'speed' in window.columns else 0.0  # доля времени в движении (>2 км/ч)
-is_moving = avg_speed > 15.0  # порог скоростного фильтра (болтанка)
-
-# Считаем общую просадку топлива в окне (только отрицательные значения)
-total_fuel_loss = float(window[window['fuel_diff'] < 0]['fuel_diff'].sum()) if len(window[window['fuel_diff'] < 0]) > 0 else 0.0
-
-# Создаем 4 колонки для компактного отображения метрик окна
-col1, col2, col3, col4 = st.columns(4)
-
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.metric(
-        "Макс. просадка за 10 мин",
-        f"{max_drop_10min:.1f} л",
-        delta="Подозрительно ⚠️" if max_drop_10min > 3.0 else "Норма",
-        delta_color="inverse" if max_drop_10min > 3.0 else "off"
-    )
-    st.metric(
-        "Макс. скорость падения",
-        f"{max_drop_rate:.2f} л/мин",
-        delta="Высокая ⚠️" if max_drop_rate > 1.0 else "Норма",
-        delta_color="inverse" if max_drop_rate > 1.0 else "off"
-    )
-with col2:
-    st.metric(
-        "Макс. монолитность падения",
-        f"{max_consecutive} точек",
-        help="Сколько точек подряд показывают строгое снижение уровня топлива"
-    )
-    st.metric(
-        "Общая просадка в окне",
-        f"{abs(total_fuel_loss):.1f} л"
-    )
-with col3:
-    st.metric(
-        "Режим техники",
-        "Стоянка ✅" if was_stationary else "В движении 🚗",
-        delta_color="normal" if was_stationary else "inverse"
-    )
-    # 🚗 НОВАЯ МЕТРИКА: средняя скорость
-    st.metric(
-        "Средняя скорость",
-        f"{avg_speed:.1f} км/ч",
-        delta="Болтанка ⚠️" if is_moving else "Стоянка",
-        delta_color="inverse" if is_moving else "normal",
-        help="При средней скорости > 15 км/ч падение уровня скорее всего вызвано болтанкой топлива, а не сливом"
-    )
-with col4:
-    st.metric(
-        "Аномалии GPS (РЭБ)",
-        f"⚠️ {gnss_anomalies_count} раз" if gnss_anomalies_count > 0 else "✅ Нет",
-        delta_color="inverse" if gnss_anomalies_count > 0 else "off"
-    )
-    st.metric(
-        "Разрывы связи",
-        f"⚠️ {conn_lost_count} раз" if conn_lost_count > 0 else "✅ Нет",
-        delta_color="inverse" if conn_lost_count > 0 else "off"
-    )
-
-# Генерация текстовой расшифровки на основе агрегированных признаков окна
-st.markdown("#### 📝 Расшифровка решения:")
-explanation = []
-
-# 🚗 0. Проверка на движение (болтанка топлива)
-if is_moving:
-    explanation.append(
-        f"🔵 Техника двигалась со средней скоростью **{avg_speed:.1f} км/ч** "
-        f"(в движении {moving_share*100:.0f}% времени, макс. {max_speed:.0f} км/ч). "
-        f"При движении падение уровня топлива с высокой вероятностью вызвано **болтанкой** "
-        f"(плескание топлива в баке), а не сливом. Слив в движении крайне маловероятен."
-    )
-elif not was_stationary:
-    explanation.append(
-        f"🟡 Техника двигалась с невысокой скоростью "
-        f"(средняя {avg_speed:.1f} км/ч, {moving_share*100:.0f}% времени в движении). "
-        f"Возможна как болтанка, так и слив при кратковременной остановке — требуется внимание."
-    )
-
-# 1. Проверка на классический слив при стоянке (по максимуму в окне)
-if was_stationary and max_drop_10min > 3.0:
-    explanation.append(f"🔴 **Техника преимущественно стояла**, но в окне анализа зафиксирована просадка топлива **{max_drop_10min:.1f} л** за 10 минут. Это основной триггер для подозрения на слив.")
-
-# 2. Проверка на монотонность (ключевой признак реального слива, а не шума)
-if max_consecutive >= 3:
-    explanation.append(f" Зафиксировано монотонное (непрерывное) падение уровня в течение **{max_consecutive} точек** подряд, что характерно для реального слива, а не для шума датчика.")
-
-# 3. Проверка на РЭБ / помехи
-if gnss_anomalies_count > 0:
-    explanation.append(f"🟡 **Обнаружены аномалии GPS/ГЛОНАСС** ({gnss_anomalies_count} раз в окне). Данные об уровне топлива в этот период могут быть искажены. Вердикт модели требует повышенной внимательности.")
-
-# 4. Проверка на ночной слив / разрыв связи
-if conn_lost_count > 0 and total_fuel_loss < -3.0:
-    explanation.append(f"🟡 Был разрыв связи. После восстановления уровень топлива оказался ниже на **{abs(total_fuel_loss):.1f} л**, что характерно для 'ночного слива'.")
-
-# 5. Если все чисто
-if not explanation:
-    explanation.append("🟢 **Признаки соответствуют нормальной эксплуатации**: в окне анализа не зафиксировано резких необъяснимых просадок уровня топлива при стоянке. Модель классифицировала это как норму.")
-
-# Выводим расшифровку списком
-for exp in explanation:
-    st.markdown(f"- {exp}")
+with st.expander("🔎 Детальный разбор события"):
+    st.markdown("---")
+    st.subheader("🔎 Детальный разбор события")
+    
+    options = [
+        f"{i+1}. {v['event_time'].strftime('%d.%m %H:%M')} — {v['label']} — {v['address']}"
+        for i, v in enumerate(verdicts)
+    ]
+    sel = st.selectbox("Выберите событие", range(len(options)), format_func=lambda i: options[i])
+    v = verdicts[sel]
+    
+    # 🔧 ПЕРЕСЧИТЫВАЕМ ОКНО ДЛЯ ВЫБРАННОГО СОБЫТИЯ
+    main_window, window_type = _build_adaptive_window(df_feat, v["event_time"], v["event_idx"])
+    event_time = v["event_time"]
+    
+    # ============================================================
+    # ОБЪЯСНЕНИЕ РЕШЕНИЯ МОДЕЛИ (XAI) - ОБНОВЛЯЕТСЯ ПРИ СМЕНЕ СОБЫТИЯ
+    # ============================================================
+    st.markdown("---")
+    st.markdown("### 🧠 Почему система приняла такое решение?")
+    st.caption("Анализ агрегированных признаков телеметрии во всем окне анализа (не только в момент события)")
+    
+    # 🔧 ИСПОЛЬЗУЕМ main_window, который пересчитан для выбранного события
+    window = main_window 
+    
+    # Рассчитываем агрегированные метрики по всему окну
+    max_drop_10min = float(window['total_drop_10min'].max()) if 'total_drop_10min' in window.columns else 0.0
+    max_drop_rate = float(window['fuel_drop_rate'].max()) if 'fuel_drop_rate' in window.columns else 0.0
+    max_consecutive = int(window['consecutive_drops'].max()) if 'consecutive_drops' in window.columns else 0
+    was_stationary = (window['speed'] == 0).mean() > 0.8  # Если >80% времени техника стояла
+    gnss_anomalies_count = int(window['is_gnss_anomaly'].sum())
+    conn_lost_count = int(window['is_connection_lost'].sum())
+    
+    # 🚗 НОВЫЕ МЕТРИКИ ДВИЖЕНИЯ
+    avg_speed = float(window['speed'].mean()) if 'speed' in window.columns else 0.0
+    max_speed = float(window['speed'].max()) if 'speed' in window.columns else 0.0
+    moving_share = float((window['speed'] > 2.0).mean()) if 'speed' in window.columns else 0.0  # доля времени в движении (>2 км/ч)
+    is_moving = avg_speed > 15.0  # порог скоростного фильтра (болтанка)
+    
+    # Считаем общую просадку топлива в окне (только отрицательные значения)
+    total_fuel_loss = float(window[window['fuel_diff'] < 0]['fuel_diff'].sum()) if len(window[window['fuel_diff'] < 0]) > 0 else 0.0
+    
+    # Создаем 4 колонки для компактного отображения метрик окна
+    col1, col2, col3, col4 = st.columns(4)
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric(
+            "Макс. просадка за 10 мин",
+            f"{max_drop_10min:.1f} л",
+            delta="Подозрительно ⚠️" if max_drop_10min > 3.0 else "Норма",
+            delta_color="inverse" if max_drop_10min > 3.0 else "off"
+        )
+        st.metric(
+            "Макс. скорость падения",
+            f"{max_drop_rate:.2f} л/мин",
+            delta="Высокая ⚠️" if max_drop_rate > 1.0 else "Норма",
+            delta_color="inverse" if max_drop_rate > 1.0 else "off"
+        )
+    with col2:
+        st.metric(
+            "Макс. монолитность падения",
+            f"{max_consecutive} точек",
+            help="Сколько точек подряд показывают строгое снижение уровня топлива"
+        )
+        st.metric(
+            "Общая просадка в окне",
+            f"{abs(total_fuel_loss):.1f} л"
+        )
+    with col3:
+        st.metric(
+            "Режим техники",
+            "Стоянка ✅" if was_stationary else "В движении 🚗",
+            delta_color="normal" if was_stationary else "inverse"
+        )
+        # 🚗 НОВАЯ МЕТРИКА: средняя скорость
+        st.metric(
+            "Средняя скорость",
+            f"{avg_speed:.1f} км/ч",
+            delta="Болтанка ⚠️" if is_moving else "Стоянка",
+            delta_color="inverse" if is_moving else "normal",
+            help="При средней скорости > 15 км/ч падение уровня скорее всего вызвано болтанкой топлива, а не сливом"
+        )
+    with col4:
+        st.metric(
+            "Аномалии GPS (РЭБ)",
+            f"⚠️ {gnss_anomalies_count} раз" if gnss_anomalies_count > 0 else "✅ Нет",
+            delta_color="inverse" if gnss_anomalies_count > 0 else "off"
+        )
+        st.metric(
+            "Разрывы связи",
+            f"⚠️ {conn_lost_count} раз" if conn_lost_count > 0 else "✅ Нет",
+            delta_color="inverse" if conn_lost_count > 0 else "off"
+        )
+    
+    # Генерация текстовой расшифровки на основе агрегированных признаков окна
+    st.markdown("#### 📝 Расшифровка решения:")
+    explanation = []
+    
+    # 🚗 0. Проверка на движение (болтанка топлива)
+    if is_moving:
+        explanation.append(
+            f"🔵 Техника двигалась со средней скоростью **{avg_speed:.1f} км/ч** "
+            f"(в движении {moving_share*100:.0f}% времени, макс. {max_speed:.0f} км/ч). "
+            f"При движении падение уровня топлива с высокой вероятностью вызвано **болтанкой** "
+            f"(плескание топлива в баке), а не сливом. Слив в движении крайне маловероятен."
+        )
+    elif not was_stationary:
+        explanation.append(
+            f"🟡 Техника двигалась с невысокой скоростью "
+            f"(средняя {avg_speed:.1f} км/ч, {moving_share*100:.0f}% времени в движении). "
+            f"Возможна как болтанка, так и слив при кратковременной остановке — требуется внимание."
+        )
+    
+    # 1. Проверка на классический слив при стоянке (по максимуму в окне)
+    if was_stationary and max_drop_10min > 3.0:
+        explanation.append(f"🔴 **Техника преимущественно стояла**, но в окне анализа зафиксирована просадка топлива **{max_drop_10min:.1f} л** за 10 минут. Это основной триггер для подозрения на слив.")
+    
+    # 2. Проверка на монотонность (ключевой признак реального слива, а не шума)
+    if max_consecutive >= 3:
+        explanation.append(f" Зафиксировано монотонное (непрерывное) падение уровня в течение **{max_consecutive} точек** подряд, что характерно для реального слива, а не для шума датчика.")
+    
+    # 3. Проверка на РЭБ / помехи
+    if gnss_anomalies_count > 0:
+        explanation.append(f"🟡 **Обнаружены аномалии GPS/ГЛОНАСС** ({gnss_anomalies_count} раз в окне). Данные об уровне топлива в этот период могут быть искажены. Вердикт модели требует повышенной внимательности.")
+    
+    # 4. Проверка на ночной слив / разрыв связи
+    if conn_lost_count > 0 and total_fuel_loss < -3.0:
+        explanation.append(f"🟡 Был разрыв связи. После восстановления уровень топлива оказался ниже на **{abs(total_fuel_loss):.1f} л**, что характерно для 'ночного слива'.")
+    
+    # 5. Если все чисто
+    if not explanation:
+        explanation.append("🟢 **Признаки соответствуют нормальной эксплуатации**: в окне анализа не зафиксировано резких необъяснимых просадок уровня топлива при стоянке. Модель классифицировала это как норму.")
+    
+    # Выводим расшифровку списком
+    for exp in explanation:
+        st.markdown(f"- {exp}")
 
 
 # Для графика используем адаптивное окно
-main_window, window_type = _build_adaptive_window(df_feat, v["event_time"], v["event_idx"])
-event_time = v["event_time"]
-
-col1, col2 = st.columns([2, 1])
-with col1:
-    st.plotly_chart(_plot_event(main_window, event_time, window_type), use_container_width=True)
-with col2:
-    st.metric("Вердикт системы", v["label"])
-    st.metric("Аномальных точек (ML)", v["anomaly_points_count"])
-    st.metric("ML score (min)", f"{v['ml_score_min']:.4f}")
-    st.metric("Просадка в окне, л", f"{v['total_drop']:.1f}")
-    st.metric("Gap drawdown, л", f"{v['gap_drop']:.1f}")
-    st.caption(f"Окно: {v['main_window_size']} точек ({'⏱️ время' if v['window_type'] == 'time' else '📊 строки'}) | Gap: {v['extended_window_size']} точек")
-    if v["rule_reason"]:
-        st.info(f"**Правило:** {v['rule_reason']}")
-
-
-# График полной телеметрии
-st.markdown("#### 📊 Полная телеметрия (с возможностью масштабирования)")
-st.caption("Используйте инструменты выше графика для приближения/удаления. Двойной клик — сброс масштаба.")
-st.plotly_chart(_plot_full_telemetry(df_feat, event_time), use_container_width=True)
+with st.expander("📊 Графики"):
+    main_window, window_type = _build_adaptive_window(df_feat, v["event_time"], v["event_idx"])
+    event_time = v["event_time"]
+    
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.plotly_chart(_plot_event(main_window, event_time, window_type), use_container_width=True)
+    with col2:
+        st.metric("Вердикт системы", v["label"])
+        st.metric("Аномальных точек (ML)", v["anomaly_points_count"])
+        st.metric("ML score (min)", f"{v['ml_score_min']:.4f}")
+        st.metric("Просадка в окне, л", f"{v['total_drop']:.1f}")
+        st.metric("Gap drawdown, л", f"{v['gap_drop']:.1f}")
+        st.caption(f"Окно: {v['main_window_size']} точек ({'⏱️ время' if v['window_type'] == 'time' else '📊 строки'}) | Gap: {v['extended_window_size']} точек")
+        if v["rule_reason"]:
+            st.info(f"**Правило:** {v['rule_reason']}")
+    
+    
+    # График полной телеметрии
+    st.markdown("#### 📊 Полная телеметрия (с возможностью масштабирования)")
+    st.caption("Используйте инструменты выше графика для приближения/удаления. Двойной клик — сброс масштаба.")
+    st.plotly_chart(_plot_full_telemetry(df_feat, event_time), use_container_width=True)
 
 # ============================================================
 # КНОПКИ ОБРАТНОЙ СВЯЗИ
